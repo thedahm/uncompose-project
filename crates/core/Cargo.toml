@@ -1,0 +1,13 @@
+[package]
+name = "uncompose-project-core"
+description = "Core library owning manifest semantics for uncompose-project."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
