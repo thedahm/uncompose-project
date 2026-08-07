@@ -6,8 +6,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, init, tagline, DEFAULT_ROLE};
+use uncompose_project_core::{add, init, show, tagline, DEFAULT_ROLE};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version)]
@@ -35,6 +37,12 @@ enum Command {
         #[arg(long, default_value = DEFAULT_ROLE)]
         role: String,
     },
+    /// Print a readable overview of the project, its assets, and derivations.
+    Show {
+        /// Emit the manifest verbatim as JSON instead of the human overview.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -45,6 +53,7 @@ fn main() -> ExitCode {
         }
         Some(Command::Init { name }) => run_init(name),
         Some(Command::Add { path, id, role }) => run_add(path, id, role),
+        Some(Command::Show { json }) => run_show(json),
     }
 }
 
@@ -83,6 +92,29 @@ fn run_init(name: Option<String>) -> ExitCode {
                 "Initialized uncompose project '{name}' ({})",
                 path.display()
             );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print the project overview, or with `--json` the manifest bytes verbatim
+/// (byte-identical to the file, for scripts and pipelines).
+fn run_show(json: bool) -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
+    };
+    match show(&root) {
+        Ok(out) => {
+            if json {
+                // Write the raw bytes unchanged; `print!` would re-encode.
+                let _ = std::io::stdout().write_all(&out.raw);
+            } else {
+                print!("{}", out.overview);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

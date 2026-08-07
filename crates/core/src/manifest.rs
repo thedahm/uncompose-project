@@ -157,12 +157,15 @@ pub fn init(root: &Path, name: &str) -> Result<PathBuf, InitError> {
     Ok(manifest_path)
 }
 
-/// Why an `add` could not register an asset. Every variant is raised before any
-/// write, so the manifest is left byte-identical on failure.
+/// Why reading an existing manifest failed. Shared by every command that reads
+/// the manifest before acting (`add`, `show`); each command maps these into its
+/// own error type. Raised before any write, so the manifest is left untouched.
 #[derive(Debug)]
-pub enum AddError {
+pub enum ReadError {
     /// No manifest at the root; run `init` first.
     NotAProject(PathBuf),
+    /// The manifest exists but could not be read (permissions, not a file).
+    Unreadable(PathBuf, io::Error),
     /// The manifest on disk is not valid JSON.
     Parse(serde_json::Error),
     /// The manifest's `schema` is not the exact v0 URL this tool recognizes
@@ -173,6 +176,44 @@ pub enum AddError {
     /// v0 shape — an unknown plain field (outside `ext`), a missing required field,
     /// or a wrong type. The wrapped error names the offending field.
     Invalid(serde_json::Error),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NotAProject(root) => write!(
+                f,
+                "{} is not an uncompose project; run `uncompose-project init` first",
+                root.display()
+            ),
+            ReadError::Unreadable(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            ReadError::Parse(e) => write!(f, "the manifest is not valid JSON: {e}"),
+            ReadError::UnrecognizedSchema { found } => match found {
+                Some(url) => write!(
+                    f,
+                    "the manifest declares schema '{url}', which this tool does not recognize; expected '{SCHEMA_URL}'"
+                ),
+                None => write!(
+                    f,
+                    "the manifest has no string 'schema' field; expected '{SCHEMA_URL}'"
+                ),
+            },
+            ReadError::Invalid(e) => {
+                write!(f, "the manifest does not conform to schema v0: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// Why an `add` could not register an asset. Every variant is raised before any
+/// write, so the manifest is left byte-identical on failure.
+#[derive(Debug)]
+pub enum AddError {
+    /// Reading the existing manifest failed (missing, unparsable, wrong schema,
+    /// or off-shape).
+    Read(ReadError),
     /// The path argument was absolute; paths are relative to the project root.
     AbsolutePath(PathBuf),
     /// The path resolves outside the project root (`../` or a symlink escape).
@@ -194,25 +235,7 @@ pub enum AddError {
 impl std::fmt::Display for AddError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AddError::NotAProject(root) => write!(
-                f,
-                "{} is not an uncompose project; run `uncompose-project init` first",
-                root.display()
-            ),
-            AddError::Parse(e) => write!(f, "the manifest is not valid JSON: {e}"),
-            AddError::UnrecognizedSchema { found } => match found {
-                Some(url) => write!(
-                    f,
-                    "the manifest declares schema '{url}', which this tool does not recognize; expected '{SCHEMA_URL}'"
-                ),
-                None => write!(
-                    f,
-                    "the manifest has no string 'schema' field; expected '{SCHEMA_URL}'"
-                ),
-            },
-            AddError::Invalid(e) => {
-                write!(f, "the manifest does not conform to schema v0: {e}")
-            }
+            AddError::Read(e) => write!(f, "{e}"),
             AddError::AbsolutePath(p) => write!(
                 f,
                 "{} is an absolute path; pass a path relative to the project root",
@@ -241,6 +264,12 @@ impl std::fmt::Display for AddError {
 
 impl std::error::Error for AddError {}
 
+impl From<ReadError> for AddError {
+    fn from(e: ReadError) -> Self {
+        AddError::Read(e)
+    }
+}
+
 /// Register the file at `rel` (relative to `root`) as an asset: hash its exact
 /// bytes, record size, root-relative forward-slash path, role, and an `added_at`
 /// timestamp. The id is `id` if given (validated against the slug pattern),
@@ -251,7 +280,7 @@ impl std::error::Error for AddError {}
 /// a missing/unreadable file, an already-registered path, or an invalid/taken id.
 pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asset, AddError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
-    let mut manifest = load_manifest(root)?;
+    let (_, mut manifest) = load_manifest(root)?;
 
     if !is_valid_slug(role) {
         return Err(AddError::InvalidSlug {
@@ -307,29 +336,127 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     Ok(asset)
 }
 
-/// Read and strictly parse the manifest at `root`. A missing manifest means the
-/// directory is not a project. The read never best-effort-parses a manifest this
-/// tool does not own: the `schema` URL must match `SCHEMA_URL` exactly, and any
-/// plain field outside the v0 shape (i.e. not `ext`) is rejected. The `schema`
-/// check runs first so an unrecognized manifest reports the version mismatch
-/// rather than incidental shape errors.
-fn load_manifest(root: &Path) -> Result<Manifest, AddError> {
+/// The result of `show`: the manifest's exact file bytes (for `--json`) and a
+/// human-readable overview of the project, its assets, and its derivations.
+pub struct ShowOutput {
+    /// The manifest file's bytes, verbatim — emitted unchanged by `show --json`.
+    pub raw: Vec<u8>,
+    /// A human-readable overview, ending in a newline.
+    pub overview: String,
+}
+
+/// Read the project at `root` (strictly, like `add`) and render it for `show`.
+/// Returns the manifest's exact bytes alongside a human overview; the caller
+/// picks which to print. Refuses a missing, unparsable, wrong-schema, or
+/// off-shape manifest — `show` never best-effort-renders a manifest it does not
+/// own.
+pub fn show(root: &Path) -> Result<ShowOutput, ReadError> {
+    let (raw, manifest) = load_manifest(root)?;
+    Ok(ShowOutput {
+        raw,
+        overview: render_overview(&manifest),
+    })
+}
+
+/// Render a manifest as a human-readable overview: the project header, then the
+/// assets and derivations, each with a count so an empty collection is shown
+/// explicitly rather than silently omitted. Derivations are read from their
+/// opaque JSON (no M1 command models them) by pulling the schema v0 fields.
+fn render_overview(m: &Manifest) -> String {
+    use std::fmt::Write;
+    let mut o = String::new();
+
+    let _ = writeln!(o, "Project: {}", m.project.name);
+    let _ = writeln!(o, "  id:      {}", m.project.id);
+    let _ = writeln!(o, "  created: {}", m.project.created_at);
+    o.push('\n');
+
+    if m.assets.is_empty() {
+        let _ = writeln!(o, "Assets (0): none");
+    } else {
+        let _ = writeln!(o, "Assets ({}):", m.assets.len());
+        for a in &m.assets {
+            let _ = writeln!(o, "  {}  {}  ({}, {} bytes)", a.id, a.path, a.role, a.size);
+            let _ = writeln!(o, "    sha256: {}", a.sha256);
+            let _ = writeln!(o, "    added:  {}", a.added_at);
+        }
+    }
+    o.push('\n');
+
+    if m.derivations.is_empty() {
+        let _ = writeln!(o, "Derivations (0): none");
+    } else {
+        let _ = writeln!(o, "Derivations ({}):", m.derivations.len());
+        for d in &m.derivations {
+            render_derivation(&mut o, d);
+        }
+    }
+
+    o
+}
+
+/// Render one derivation from its opaque JSON value, reading the schema v0 fields
+/// (`id`, `tool`, optional `tool_version`, `inputs`, `outputs`, `created_at`).
+/// Missing or off-type fields degrade to a placeholder rather than panicking, so
+/// `show` stays a read-only view.
+fn render_derivation(o: &mut String, d: &Value) {
+    use std::fmt::Write;
+    let str_field = |key: &str| d.get(key).and_then(Value::as_str);
+    let id = str_field("id").unwrap_or("?");
+    let tool = str_field("tool").unwrap_or("?");
+    match str_field("tool_version") {
+        Some(v) => {
+            let _ = writeln!(o, "  {id}  ({tool} v{v})");
+        }
+        None => {
+            let _ = writeln!(o, "  {id}  ({tool})");
+        }
+    }
+    let _ = writeln!(o, "    inputs:  {}", join_slugs(d.get("inputs")));
+    let _ = writeln!(o, "    outputs: {}", join_slugs(d.get("outputs")));
+    if let Some(created) = str_field("created_at") {
+        let _ = writeln!(o, "    created: {created}");
+    }
+}
+
+/// Comma-join a JSON array of slug strings, ignoring any non-string entries.
+fn join_slugs(v: Option<&Value>) -> String {
+    v.and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Read and strictly parse the manifest at `root`, returning both the exact file
+/// bytes (so a command can re-emit them verbatim) and the parsed manifest. A
+/// missing manifest means the directory is not a project. The read never
+/// best-effort-parses a manifest this tool does not own: the `schema` URL must
+/// match `SCHEMA_URL` exactly, and any plain field outside the v0 shape (i.e. not
+/// `ext`) is rejected. The `schema` check runs first so an unrecognized manifest
+/// reports the version mismatch rather than incidental shape errors.
+fn load_manifest(root: &Path) -> Result<(Vec<u8>, Manifest), ReadError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(AddError::NotAProject(root.to_path_buf()))
+            return Err(ReadError::NotAProject(root.to_path_buf()))
         }
-        Err(e) => return Err(AddError::Unreadable(manifest_path, e)),
+        Err(e) => return Err(ReadError::Unreadable(manifest_path, e)),
     };
-    let value: Value = serde_json::from_slice(&bytes).map_err(AddError::Parse)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(ReadError::Parse)?;
     let found = value.get("schema").and_then(Value::as_str);
     if found != Some(SCHEMA_URL) {
-        return Err(AddError::UnrecognizedSchema {
+        return Err(ReadError::UnrecognizedSchema {
             found: found.map(str::to_string),
         });
     }
-    serde_json::from_value(value).map_err(AddError::Invalid)
+    let manifest = serde_json::from_value(value).map_err(ReadError::Invalid)?;
+    Ok((bytes, manifest))
 }
 
 /// Resolve `rel` against `root` and return its root-relative, forward-slash path,
