@@ -484,3 +484,160 @@ fn ext_subtrees_survive_read_modify_write_at_every_level() {
 
     assert_valid_against_schema(&manifest);
 }
+
+// --- M1.5: verify with integrity statuses and the milestone DoD ---
+
+#[test]
+fn verify_reports_all_verified_updates_last_verified_and_exits_zero() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+
+    // Nothing on disk changed: verify should pass, exit zero, and stamp
+    // last_verified on the asset that passed.
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        output.status.success(),
+        "verify should exit zero when all assets pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("verified") && stdout.contains("song.wav"),
+        "verify should report the asset as verified: {stdout}"
+    );
+
+    let manifest = read_manifest(dir.path());
+    let asset = &manifest["assets"][0];
+    let last_verified = asset["last_verified"].as_str();
+    assert!(
+        last_verified.is_some_and(|s| s.contains('T')),
+        "a passing asset should get an RFC3339 last_verified: {asset}"
+    );
+    // Integrity is derived, never a stored status claim.
+    assert!(
+        asset.get("status").is_none(),
+        "no status field is persisted"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Milestone DoD (modified): change a registered file on disk, then `verify`
+/// must warn — naming the path and that the contents changed — and exit non-zero.
+#[test]
+fn verify_flags_a_modified_file_with_a_warning_and_nonzero_exit() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+
+    // Same size, different bytes — the hash catches what the size check misses.
+    fs::write(dir.path().join("song.wav"), b"world").unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "verify should exit non-zero when an asset is modified"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("song.wav") && combined.contains("modified"),
+        "verify should name the path and how it failed: {combined}"
+    );
+
+    // A modified asset does not get a fresh last_verified.
+    let manifest = read_manifest(dir.path());
+    assert!(
+        manifest["assets"][0]["last_verified"].is_null(),
+        "a failing asset must not be stamped last_verified"
+    );
+}
+
+/// Milestone DoD (missing): delete a registered file, then `verify` must report
+/// it missing and exit non-zero.
+#[test]
+fn verify_flags_a_missing_file_with_a_warning_and_nonzero_exit() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+
+    fs::remove_file(dir.path().join("song.wav")).unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "verify should exit non-zero when an asset is missing"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("song.wav") && combined.contains("missing"),
+        "verify should name the path and report it missing: {combined}"
+    );
+}
+
+#[test]
+fn verify_checks_size_before_hash_flagging_a_truncated_file_modified() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+
+    // A different size is a cheap mismatch caught before hashing.
+    fs::write(dir.path().join("song.wav"), b"hi").unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("song.wav") && combined.contains("modified"),
+        "a size mismatch should read as modified: {combined}"
+    );
+}
+
+#[test]
+fn verify_updates_passing_assets_even_when_another_asset_fails() {
+    let dir = init_project();
+    fs::write(dir.path().join("good.wav"), b"hello").unwrap();
+    fs::write(dir.path().join("bad.wav"), b"world").unwrap();
+    assert!(run(dir.path(), &["add", "good.wav"]).status.success());
+    assert!(run(dir.path(), &["add", "bad.wav"]).status.success());
+
+    fs::remove_file(dir.path().join("bad.wav")).unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(!output.status.success(), "a missing asset fails the run");
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    let good = assets.iter().find(|a| a["id"] == "good").unwrap();
+    let bad = assets.iter().find(|a| a["id"] == "bad").unwrap();
+    assert!(
+        good["last_verified"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
+        "the passing asset should be stamped even though another failed: {good}"
+    );
+    assert!(
+        bad["last_verified"].is_null(),
+        "the missing asset must not be stamped: {bad}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+#[test]
+fn verify_refuses_when_the_directory_is_not_a_project() {
+    let dir = TempDir::new().unwrap();
+    let output = run(dir.path(), &["verify"]);
+    assert!(!output.status.success());
+    assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+}

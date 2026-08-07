@@ -77,6 +77,11 @@ pub struct Asset {
     pub size: u64,
     pub role: String,
     pub added_at: String,
+    /// Cache of the last successful integrity check (RFC3339). Never a status
+    /// claim — integrity is re-derived from disk on every `verify`. Absent until
+    /// the asset first passes; skipped in serialization while absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<Value>,
 }
@@ -157,12 +162,16 @@ pub fn init(root: &Path, name: &str) -> Result<PathBuf, InitError> {
     Ok(manifest_path)
 }
 
-/// Why an `add` could not register an asset. Every variant is raised before any
-/// write, so the manifest is left byte-identical on failure.
+/// Why a manifest could not be read and strictly parsed. Shared by every command
+/// that reads before it writes (`add`, `verify`), so the strict-read policy lives
+/// in one place. Every variant is raised before any write, leaving the manifest
+/// byte-identical.
 #[derive(Debug)]
-pub enum AddError {
+pub enum LoadError {
     /// No manifest at the root; run `init` first.
     NotAProject(PathBuf),
+    /// The manifest exists but could not be read (permissions, not a regular file).
+    Unreadable(PathBuf, io::Error),
     /// The manifest on disk is not valid JSON.
     Parse(serde_json::Error),
     /// The manifest's `schema` is not the exact v0 URL this tool recognizes
@@ -173,6 +182,43 @@ pub enum AddError {
     /// v0 shape — an unknown plain field (outside `ext`), a missing required field,
     /// or a wrong type. The wrapped error names the offending field.
     Invalid(serde_json::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::NotAProject(root) => write!(
+                f,
+                "{} is not an uncompose project; run `uncompose-project init` first",
+                root.display()
+            ),
+            LoadError::Unreadable(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            LoadError::Parse(e) => write!(f, "the manifest is not valid JSON: {e}"),
+            LoadError::UnrecognizedSchema { found } => match found {
+                Some(url) => write!(
+                    f,
+                    "the manifest declares schema '{url}', which this tool does not recognize; expected '{SCHEMA_URL}'"
+                ),
+                None => write!(
+                    f,
+                    "the manifest has no string 'schema' field; expected '{SCHEMA_URL}'"
+                ),
+            },
+            LoadError::Invalid(e) => {
+                write!(f, "the manifest does not conform to schema v0: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Why an `add` could not register an asset. Every variant is raised before any
+/// write, so the manifest is left byte-identical on failure.
+#[derive(Debug)]
+pub enum AddError {
+    /// The manifest could not be read/parsed (see [`LoadError`]).
+    Load(LoadError),
     /// The path argument was absolute; paths are relative to the project root.
     AbsolutePath(PathBuf),
     /// The path resolves outside the project root (`../` or a symlink escape).
@@ -194,25 +240,7 @@ pub enum AddError {
 impl std::fmt::Display for AddError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AddError::NotAProject(root) => write!(
-                f,
-                "{} is not an uncompose project; run `uncompose-project init` first",
-                root.display()
-            ),
-            AddError::Parse(e) => write!(f, "the manifest is not valid JSON: {e}"),
-            AddError::UnrecognizedSchema { found } => match found {
-                Some(url) => write!(
-                    f,
-                    "the manifest declares schema '{url}', which this tool does not recognize; expected '{SCHEMA_URL}'"
-                ),
-                None => write!(
-                    f,
-                    "the manifest has no string 'schema' field; expected '{SCHEMA_URL}'"
-                ),
-            },
-            AddError::Invalid(e) => {
-                write!(f, "the manifest does not conform to schema v0: {e}")
-            }
+            AddError::Load(e) => write!(f, "{e}"),
             AddError::AbsolutePath(p) => write!(
                 f,
                 "{} is an absolute path; pass a path relative to the project root",
@@ -240,6 +268,12 @@ impl std::fmt::Display for AddError {
 }
 
 impl std::error::Error for AddError {}
+
+impl From<LoadError> for AddError {
+    fn from(e: LoadError) -> Self {
+        AddError::Load(e)
+    }
+}
 
 /// Register the file at `rel` (relative to `root`) as an asset: hash its exact
 /// bytes, record size, root-relative forward-slash path, role, and an `added_at`
@@ -298,6 +332,7 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
         size,
         role: role.to_string(),
         added_at: now_rfc3339(),
+        last_verified: None,
         ext: None,
     };
     manifest.assets.push(asset.clone());
@@ -307,29 +342,158 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     Ok(asset)
 }
 
+/// The integrity of one asset, derived by re-checking disk against its recorded
+/// identity. Never stored in the manifest — computed fresh on every `verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integrity {
+    /// Size and sha256 both match the recorded values.
+    Verified,
+    /// The file exists but its size or contents no longer match.
+    Modified,
+    /// No file exists at the asset's path.
+    Missing,
+}
+
+/// One asset's integrity outcome for a `verify` run: its id, path, and status.
+#[derive(Debug, Clone)]
+pub struct AssetStatus {
+    pub id: String,
+    pub path: String,
+    pub integrity: Integrity,
+}
+
+/// The result of a `verify`: a per-asset integrity status in manifest order.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    pub statuses: Vec<AssetStatus>,
+}
+
+impl VerifyReport {
+    /// Whether every asset verified. `verify` callers exit non-zero when this is
+    /// false so scripts and CI can gate on project integrity.
+    pub fn all_verified(&self) -> bool {
+        self.statuses
+            .iter()
+            .all(|s| s.integrity == Integrity::Verified)
+    }
+}
+
+/// Why a `verify` could not run to completion.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The manifest could not be read/parsed (see [`LoadError`]).
+    Load(LoadError),
+    /// An asset's file exists but could not be read to hash it (permissions, a
+    /// directory). A missing file is a [`Integrity::Missing`] status, not this.
+    Unreadable(PathBuf, io::Error),
+    /// Rewriting the manifest with refreshed `last_verified` timestamps failed.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyError::Load(e) => write!(f, "{e}"),
+            VerifyError::Unreadable(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            VerifyError::Io(e) => write!(f, "failed to write manifest: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+impl From<LoadError> for VerifyError {
+    fn from(e: LoadError) -> Self {
+        VerifyError::Load(e)
+    }
+}
+
+/// Re-check every asset against the files on disk and report each as verified,
+/// modified, or missing. Size is compared first (a cheap mismatch), then the
+/// sha256. Assets that pass get their cached `last_verified` refreshed and the
+/// manifest is rewritten canonically and atomically; integrity itself is never
+/// stored. Refuses — leaving the manifest untouched — when the directory is not a
+/// project or the manifest does not conform.
+pub fn verify(root: &Path) -> Result<VerifyReport, VerifyError> {
+    let manifest_path = root.join(MANIFEST_FILENAME);
+    let mut manifest = load_manifest(root)?;
+    let now = now_rfc3339();
+
+    let mut statuses = Vec::with_capacity(manifest.assets.len());
+    let mut changed = false;
+    for asset in &mut manifest.assets {
+        let integrity = check_integrity(root, asset)?;
+        if integrity == Integrity::Verified {
+            asset.last_verified = Some(now.clone());
+            changed = true;
+        }
+        statuses.push(AssetStatus {
+            id: asset.id.clone(),
+            path: asset.path.clone(),
+            integrity,
+        });
+    }
+
+    // Only rewrite when a passing asset refreshed its timestamp; an all-failing
+    // run leaves the manifest byte-identical.
+    if changed {
+        let bytes = manifest.to_canonical_json();
+        write_atomic(&manifest_path, bytes.as_bytes()).map_err(VerifyError::Io)?;
+    }
+
+    Ok(VerifyReport { statuses })
+}
+
+/// Derive one asset's integrity from disk: size first (cheap), then sha256. A
+/// file that is not there is [`Integrity::Missing`]; a size or content mismatch is
+/// [`Integrity::Modified`]; a genuine read failure is a [`VerifyError`].
+fn check_integrity(root: &Path, asset: &Asset) -> Result<Integrity, VerifyError> {
+    // Stored paths are forward-slash and root-relative; rebuild per-OS components.
+    let rel: PathBuf = asset.path.split('/').collect();
+    let path = root.join(rel);
+
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Integrity::Missing),
+        Err(e) => return Err(VerifyError::Unreadable(path, e)),
+    };
+    if metadata.len() != asset.size {
+        return Ok(Integrity::Modified);
+    }
+
+    let mut file = File::open(&path).map_err(|e| VerifyError::Unreadable(path.clone(), e))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher).map_err(|e| VerifyError::Unreadable(path.clone(), e))?;
+    if hex_digest(&hasher.finalize()) == asset.sha256 {
+        Ok(Integrity::Verified)
+    } else {
+        Ok(Integrity::Modified)
+    }
+}
+
 /// Read and strictly parse the manifest at `root`. A missing manifest means the
 /// directory is not a project. The read never best-effort-parses a manifest this
 /// tool does not own: the `schema` URL must match `SCHEMA_URL` exactly, and any
 /// plain field outside the v0 shape (i.e. not `ext`) is rejected. The `schema`
 /// check runs first so an unrecognized manifest reports the version mismatch
 /// rather than incidental shape errors.
-fn load_manifest(root: &Path) -> Result<Manifest, AddError> {
+fn load_manifest(root: &Path) -> Result<Manifest, LoadError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(AddError::NotAProject(root.to_path_buf()))
+            return Err(LoadError::NotAProject(root.to_path_buf()))
         }
-        Err(e) => return Err(AddError::Unreadable(manifest_path, e)),
+        Err(e) => return Err(LoadError::Unreadable(manifest_path, e)),
     };
-    let value: Value = serde_json::from_slice(&bytes).map_err(AddError::Parse)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(LoadError::Parse)?;
     let found = value.get("schema").and_then(Value::as_str);
     if found != Some(SCHEMA_URL) {
-        return Err(AddError::UnrecognizedSchema {
+        return Err(LoadError::UnrecognizedSchema {
             found: found.map(str::to_string),
         });
     }
-    serde_json::from_value(value).map_err(AddError::Invalid)
+    serde_json::from_value(value).map_err(LoadError::Invalid)
 }
 
 /// Resolve `rel` against `root` and return its root-relative, forward-slash path,
@@ -366,9 +530,12 @@ fn hash_file(root: &Path, rel: &Path) -> Result<(String, u64), AddError> {
     let mut hasher = Sha256::new();
     let size =
         io::copy(&mut file, &mut hasher).map_err(|e| AddError::Unreadable(rel.to_path_buf(), e))?;
-    let digest = hasher.finalize();
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect();
-    Ok((hex, size))
+    Ok((hex_digest(&hasher.finalize()), size))
+}
+
+/// Render a digest as lowercase hex — the manifest's sha256 form.
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A character the schema slug pattern allows at the start: `[a-z0-9]`.

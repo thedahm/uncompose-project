@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, init, tagline, DEFAULT_ROLE};
+use uncompose_project_core::{add, init, tagline, verify, Integrity, DEFAULT_ROLE};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version)]
@@ -35,6 +35,8 @@ enum Command {
         #[arg(long, default_value = DEFAULT_ROLE)]
         role: String,
     },
+    /// Check that each registered file still matches its recorded identity.
+    Verify,
 }
 
 fn main() -> ExitCode {
@@ -45,6 +47,7 @@ fn main() -> ExitCode {
         }
         Some(Command::Init { name }) => run_init(name),
         Some(Command::Add { path, id, role }) => run_add(path, id, role),
+        Some(Command::Verify) => run_verify(),
     }
 }
 
@@ -89,6 +92,43 @@ fn run_init(name: Option<String>) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_verify() -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
+    };
+    let report = match verify(&root) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Passes to stdout; failures to stderr as warnings naming path and cause.
+    let mut modified = 0;
+    let mut missing = 0;
+    for status in &report.statuses {
+        match status.integrity {
+            Integrity::Verified => println!("verified  {}", status.path),
+            Integrity::Modified => {
+                modified += 1;
+                eprintln!("warning: {} modified (contents changed)", status.path);
+            }
+            Integrity::Missing => {
+                missing += 1;
+                eprintln!("warning: {} missing (file not found)", status.path);
+            }
+        }
+    }
+
+    if report.all_verified() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("error: verification failed: {modified} modified, {missing} missing");
+        ExitCode::FAILURE
     }
 }
 
