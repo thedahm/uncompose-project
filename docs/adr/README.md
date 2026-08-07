@@ -14,3 +14,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0002 — Canonical, atomic manifest writes](0002-canonical-atomic-manifest-writes.md)
 - [0003 — `add`: hashing, slug ids, and path validation](0003-add-command-hashing-slugs-path-validation.md)
 - [0004 — maturin wheel packaging and root dispatch conformance](0004-maturin-wheel-packaging-and-dispatch-conformance.md)
+- [0005 — Strict manifest reads and `ext` pass-through](0005-strict-manifest-reads-and-ext-passthrough.md)

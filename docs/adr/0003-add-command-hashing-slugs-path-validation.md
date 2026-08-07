@@ -52,7 +52,9 @@ slashes, resolves inside the root." This ADR records how `add` satisfies that.
   exists for when the stem is a poor name.
 - Canonicalization requires the file to exist on disk at `add` time, which is
   already required to hash it — the checks share one resolution.
-- `add` round-trips only the v0 core fields it models. `ext` subtrees and future
-  optional asset fields (e.g. `last_verified`) are preserved by the command that
-  first writes them (verify, import), consistent with modeling only what each
-  command needs (ADR-0001, ADR-0002).
+- `add` round-trips only the v0 core fields it models. Future optional *typed*
+  asset fields (e.g. `last_verified`) are preserved by the command that first
+  writes them (verify, import), consistent with modeling only what each command
+  needs (ADR-0001, ADR-0002). `ext` pass-through was later made a property of the
+  read path itself (ADR-0005), so every reading command carries `ext` subtrees
+  through verbatim — superseding this note's original claim about `ext`.

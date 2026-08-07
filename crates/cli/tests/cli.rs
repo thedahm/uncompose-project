@@ -368,3 +368,119 @@ fn add_refuses_when_the_directory_is_not_a_project() {
     assert!(!output.status.success());
     assert!(!dir.path().join(MANIFEST_FILENAME).exists());
 }
+
+// --- M1.6: strict read path, schema URL check, unknown-field rejection, ext ---
+
+#[test]
+fn add_refuses_a_manifest_whose_schema_url_is_not_the_recognized_v0() {
+    let dir = TempDir::new().unwrap();
+    // Valid JSON, valid shape, but a schema URL this tool version does not own.
+    // Rejected by exact string match — no version-range cleverness (uncompose#64).
+    let bogus = "{\n  \"schema\": \"https://uncompose.org/schemas/project/v99/uncompose.project.schema.json\",\n  \"project\": { \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" },\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": []\n}\n";
+    fs::write(dir.path().join(MANIFEST_FILENAME), bogus).unwrap();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+
+    assert!(
+        !output.status.success(),
+        "reading an unrecognized-schema manifest should refuse"
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("schema") && stderr.contains(SCHEMA_URL),
+        "error should name the schema mismatch and the expected URL: {stderr}"
+    );
+    // No partial parsing: the manifest is left byte-identical.
+    assert_eq!(
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        bogus
+    );
+}
+
+#[test]
+fn add_refuses_a_manifest_with_an_unknown_field_naming_it() {
+    let dir = TempDir::new().unwrap();
+    // Correct schema URL, but a stray top-level field (a typo / from-the-future
+    // key) that is not `ext`. Must be caught, not silently dropped.
+    let with_unknown = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": [],\n  \"totally_unknown\": true\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &with_unknown).unwrap();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+
+    assert!(!output.status.success(), "an unknown field should refuse");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("totally_unknown"),
+        "error should name the offending field: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        with_unknown
+    );
+}
+
+/// Named conformance test (uncompose#64): `ext` blobs at project, asset, and
+/// derivation level survive a rewriting command (`add`) verbatim.
+#[test]
+fn ext_subtrees_survive_read_modify_write_at_every_level() {
+    let dir = TempDir::new().unwrap();
+    // A schema-valid manifest carrying `ext` at three levels. Keys are namespace
+    // slugs, deliberately in non-alphabetical order so a re-sort would show.
+    let seed = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{\n    \"id\": \"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\n    \"name\": \"demo\",\n    \"created_at\": \"2020-01-01T00:00:00Z\",\n    \"ext\": {{\n      \"zeta.notes\": {{ \"beta\": 2, \"alpha\": 1 }},\n      \"acme.tags\": [\"keep\", \"me\"]\n    }}\n  }},\n  \"assets\": [\n    {{\n      \"id\": \"existing\",\n      \"path\": \"existing.wav\",\n      \"sha256\": \"{HELLO_SHA256}\",\n      \"size\": 5,\n      \"role\": \"mix\",\n      \"added_at\": \"2020-01-01T00:00:00Z\",\n      \"ext\": {{ \"vendor.meta\": {{ \"take\": 3 }} }}\n    }}\n  ],\n  \"derivations\": [\n    {{\n      \"id\": \"mixdown\",\n      \"inputs\": [\"existing\"],\n      \"outputs\": [\"existing\"],\n      \"tool\": \"manual\",\n      \"created_at\": \"2020-01-01T00:00:00Z\",\n      \"ext\": {{ \"zzz.last\": {{ \"seen\": true }}, \"aaa.first\": {{ \"seen\": false }} }}\n    }}\n  ],\n  \"evaluations\": []\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &seed).unwrap();
+    fs::write(dir.path().join("new.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "new.wav"]);
+    assert!(
+        output.status.success(),
+        "add over an ext-bearing manifest should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let manifest: Value = serde_json::from_str(&text).unwrap();
+
+    // The rewrite took effect: the new asset is present alongside the seeded one.
+    let assets = manifest["assets"].as_array().unwrap();
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets[1]["id"], "new");
+
+    // Every ext subtree survives with its data intact.
+    assert_eq!(
+        manifest["project"]["ext"],
+        serde_json::json!({ "zeta.notes": { "beta": 2, "alpha": 1 }, "acme.tags": ["keep", "me"] })
+    );
+    assert_eq!(
+        manifest["assets"][0]["ext"],
+        serde_json::json!({ "vendor.meta": { "take": 3 } })
+    );
+    assert_eq!(
+        manifest["derivations"][0]["ext"],
+        serde_json::json!({ "zzz.last": { "seen": true }, "aaa.first": { "seen": false } })
+    );
+
+    // Verbatim, not merely intact: the original key order is preserved, so a
+    // rewrite never normalizes a third party's opaque blob.
+    let zeta = text.find("zeta.notes").unwrap();
+    let acme = text.find("acme.tags").unwrap();
+    assert!(
+        zeta < acme,
+        "project ext key order should be preserved: {text}"
+    );
+    let zzz = text.find("zzz.last").unwrap();
+    let aaa = text.find("aaa.first").unwrap();
+    assert!(
+        zzz < aaa,
+        "derivation ext key order should be preserved: {text}"
+    );
+
+    assert_valid_against_schema(&manifest);
+}

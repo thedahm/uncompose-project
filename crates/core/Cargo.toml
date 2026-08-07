@@ -12,7 +12,9 @@ workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order keeps opaque `ext`/derivation object keys in their on-disk order,
+# so a read-modify-write carries a third party's subtree through verbatim (uncompose#64).
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 ulid = "1"
 time = { version = "0.3", features = ["formatting"] }

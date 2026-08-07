@@ -5,8 +5,13 @@
 //! and `add` registers assets; derivations and evaluations are part of schema v0
 //! (see the in-repo JSON Schema) but no M1 command populates them, so their
 //! collections round-trip as opaque JSON until the import work that owns them
-//! lands. Likewise, `ext` passthrough on read-modify-write arrives with the first
-//! command that writes an `ext` subtree; nothing in M1 does.
+//! lands.
+//!
+//! Reads are strict: the manifest's `schema` URL is matched exactly against
+//! [`SCHEMA_URL`] and any plain field outside the v0 shape is rejected, so the
+//! tool never best-effort-parses a manifest it does not own. The one reserved
+//! exception is `ext` — an opaque, namespace-slug-keyed extension subtree legal on
+//! every object — which is carried through read-modify-write verbatim (uncompose#64).
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -32,27 +37,39 @@ pub const SCHEMA_URL: &str =
 pub const DEFAULT_ROLE: &str = "mix";
 
 /// A project manifest in canonical field order.
+///
+/// `deny_unknown_fields` makes reads strict: a plain field outside this set (a
+/// typo, a from-the-future key) is rejected rather than silently dropped. The one
+/// reserved exception is `ext` — a namespace-slug-keyed, opaque extension subtree
+/// legal on every object, carried through read-modify-write verbatim (uncompose#64).
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: String,
     pub project: Project,
     pub assets: Vec<Asset>,
     pub derivations: Vec<Value>,
     pub evaluations: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
 }
 
 /// The `project` object: identity minted once at init.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Project {
     pub id: String,
     pub name: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
 }
 
 /// A file registered into the project. Its identity is its `sha256` + `size` over
 /// exact bytes, captured at registration; `path` is a mutable location hint. Field
 /// order matches the schema's canonical order.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Asset {
     pub id: String,
     pub path: String,
@@ -60,6 +77,8 @@ pub struct Asset {
     pub size: u64,
     pub role: String,
     pub added_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
 }
 
 impl Manifest {
@@ -72,10 +91,12 @@ impl Manifest {
                 id: Ulid::new().to_string(),
                 name: name.into(),
                 created_at: now_rfc3339(),
+                ext: None,
             },
             assets: Vec::new(),
             derivations: Vec::new(),
             evaluations: Vec::new(),
+            ext: None,
         }
     }
 
@@ -142,8 +163,16 @@ pub fn init(root: &Path, name: &str) -> Result<PathBuf, InitError> {
 pub enum AddError {
     /// No manifest at the root; run `init` first.
     NotAProject(PathBuf),
-    /// The manifest on disk could not be parsed.
+    /// The manifest on disk is not valid JSON.
     Parse(serde_json::Error),
+    /// The manifest's `schema` is not the exact v0 URL this tool recognizes
+    /// (missing, or some other value). Compared by exact string match, no
+    /// version-range cleverness (uncompose#64). `found` is the declared value.
+    UnrecognizedSchema { found: Option<String> },
+    /// The manifest is valid JSON with the right schema URL but does not match the
+    /// v0 shape — an unknown plain field (outside `ext`), a missing required field,
+    /// or a wrong type. The wrapped error names the offending field.
+    Invalid(serde_json::Error),
     /// The path argument was absolute; paths are relative to the project root.
     AbsolutePath(PathBuf),
     /// The path resolves outside the project root (`../` or a symlink escape).
@@ -171,6 +200,19 @@ impl std::fmt::Display for AddError {
                 root.display()
             ),
             AddError::Parse(e) => write!(f, "the manifest is not valid JSON: {e}"),
+            AddError::UnrecognizedSchema { found } => match found {
+                Some(url) => write!(
+                    f,
+                    "the manifest declares schema '{url}', which this tool does not recognize; expected '{SCHEMA_URL}'"
+                ),
+                None => write!(
+                    f,
+                    "the manifest has no string 'schema' field; expected '{SCHEMA_URL}'"
+                ),
+            },
+            AddError::Invalid(e) => {
+                write!(f, "the manifest does not conform to schema v0: {e}")
+            }
             AddError::AbsolutePath(p) => write!(
                 f,
                 "{} is an absolute path; pass a path relative to the project root",
@@ -256,6 +298,7 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
         size,
         role: role.to_string(),
         added_at: now_rfc3339(),
+        ext: None,
     };
     manifest.assets.push(asset.clone());
 
@@ -264,8 +307,12 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     Ok(asset)
 }
 
-/// Read and parse the manifest at `root`. A missing manifest means the
-/// directory is not a project.
+/// Read and strictly parse the manifest at `root`. A missing manifest means the
+/// directory is not a project. The read never best-effort-parses a manifest this
+/// tool does not own: the `schema` URL must match `SCHEMA_URL` exactly, and any
+/// plain field outside the v0 shape (i.e. not `ext`) is rejected. The `schema`
+/// check runs first so an unrecognized manifest reports the version mismatch
+/// rather than incidental shape errors.
 fn load_manifest(root: &Path) -> Result<Manifest, AddError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let bytes = match std::fs::read(&manifest_path) {
@@ -275,7 +322,14 @@ fn load_manifest(root: &Path) -> Result<Manifest, AddError> {
         }
         Err(e) => return Err(AddError::Unreadable(manifest_path, e)),
     };
-    serde_json::from_slice(&bytes).map_err(AddError::Parse)
+    let value: Value = serde_json::from_slice(&bytes).map_err(AddError::Parse)?;
+    let found = value.get("schema").and_then(Value::as_str);
+    if found != Some(SCHEMA_URL) {
+        return Err(AddError::UnrecognizedSchema {
+            found: found.map(str::to_string),
+        });
+    }
+    serde_json::from_value(value).map_err(AddError::Invalid)
 }
 
 /// Resolve `rel` against `root` and return its root-relative, forward-slash path,
