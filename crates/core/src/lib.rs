@@ -1,9 +1,11 @@
 //! Core library for `uncompose-project`.
 //!
-//! This crate will own manifest semantics — reading, validating, and writing
-//! the canonical `uncompose.project.json` — for the thin CLI layered over it.
-//! For the M1.1 foundation it is a hello-world skeleton so every CI lane
-//! (fmt, clippy, test) exercises real work.
+//! This crate owns manifest semantics — building, canonically serializing, and
+//! writing the `uncompose.project.json` — for the thin CLI layered over it.
+
+pub mod manifest;
+
+pub use manifest::{init, InitError, Manifest, Project, SCHEMA_URL};
 
 /// The fixed name of the project manifest at the root of an uncompose project.
 pub const MANIFEST_FILENAME: &str = "uncompose.project.json";

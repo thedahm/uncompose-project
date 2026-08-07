@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uncompose.org/schemas/project/v0/uncompose.project.schema.json",
+  "title": "uncompose.project.json (v0)",
+  "type": "object",
+  "required": ["schema", "project", "assets", "derivations", "evaluations"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "https://uncompose.org/schemas/project/v0/uncompose.project.schema.json",
+      "description": "Absolute schema URL, compared by exact string match (uncompose#64)."
+    },
+    "project": {
+      "type": "object",
+      "required": ["id", "name", "created_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "ULID, minted at project init" },
+        "name": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "derivations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/derivation" }
+    },
+    "evaluations": {
+      "type": "array",
+      "description": "Reserved. Item shape owned by uncompose#63; empty in v0.",
+      "items": { "type": "object" }
+    },
+    "ext": { "$ref": "#/$defs/ext" }
+  },
+  "$defs": {
+    "slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "ext": {
+      "type": "object",
+      "description": "Reserved extension namespace, legal on every object. Keys are namespace slugs; values are opaque and preserved verbatim across read-modify-write (uncompose#64).",
+      "propertyNames": { "$ref": "#/$defs/slug" }
+    },
+    "asset": {
+      "type": "object",
+      "required": ["id", "path", "sha256", "size", "role", "added_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "path": {
+          "type": "string",
+          "description": "Relative to the project root, forward slashes, resolves inside the root. Location hint, not identity."
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "role": {
+          "$ref": "#/$defs/slug",
+          "description": "Open vocabulary; recommended: mix, stem, reference"
+        },
+        "added_at": { "type": "string", "format": "date-time" },
+        "last_verified": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Cache of the last successful integrity check. Never a status claim."
+        },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "derivation": {
+      "type": "object",
+      "required": ["id", "inputs", "outputs", "tool", "created_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "inputs": { "type": "array", "items": { "$ref": "#/$defs/slug" }, "minItems": 1 },
+        "outputs": { "type": "array", "items": { "$ref": "#/$defs/slug" }, "minItems": 1 },
+        "tool": { "type": "string", "description": "e.g. \"uncompose\"; \"manual\" for out-of-band edits" },
+        "tool_version": { "type": "string" },
+        "params": { "type": "object", "description": "Opaque to the schema; owned by the tool that wrote it" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "job": {
+          "type": "object",
+          "required": ["path", "sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "ext": { "$ref": "#/$defs/ext" }
+          },
+          "description": "Hashed reference to an imported job.json (C2PA hashed-ref pattern). Referenced, never absorbed."
+        },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    }
+  }
+}

@@ -8,5 +8,7 @@ reasoning — in a file named `NNNN-short-slug.md`. Ecosystem-wide decisions liv
 number where they apply here (e.g. manifest schema core uncompose#62, versioning
 uncompose#64, dispatch uncompose ADR-0005).
 
-No ADRs exist yet. The first ones land with implementation — at minimum the adoption of
-manifest schema v0 and the canonical/atomic-write policy.
+## Records
+
+- [0001 — Adopt manifest schema v0](0001-adopt-manifest-schema-v0.md)
+- [0002 — Canonical, atomic manifest writes](0002-canonical-atomic-manifest-writes.md)
