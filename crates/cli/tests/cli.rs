@@ -121,3 +121,165 @@ fn init_refuses_when_a_manifest_already_exists() {
     // The existing manifest is untouched.
     assert_eq!(fs::read_to_string(&manifest).unwrap(), sentinel);
 }
+
+/// sha256 of the bytes `b"hello"`; size 5. Used across the add tests.
+const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+/// Initialize a project in a fresh temp dir and return it.
+fn init_project() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let out = run(dir.path(), &["init"]);
+    assert!(out.status.success());
+    dir
+}
+
+fn read_manifest(root: &Path) -> Value {
+    let bytes = fs::read_to_string(root.join(MANIFEST_FILENAME)).unwrap();
+    serde_json::from_str(&bytes).unwrap()
+}
+
+#[test]
+fn add_registers_an_asset_with_hash_size_path_role_and_timestamp() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    assert_eq!(assets.len(), 1);
+    let asset = &assets[0];
+    assert_eq!(asset["id"], "song");
+    assert_eq!(asset["path"], "song.wav");
+    assert_eq!(asset["sha256"], HELLO_SHA256);
+    assert_eq!(asset["size"], 5);
+    assert_eq!(asset["role"], "mix");
+    assert!(asset["added_at"].as_str().unwrap().contains('T'));
+
+    assert_valid_against_schema(&manifest);
+}
+
+#[test]
+fn add_role_flag_sets_the_role() {
+    let dir = init_project();
+    fs::write(dir.path().join("bass.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "bass.wav", "--role", "stem"]);
+    assert!(output.status.success());
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["assets"][0]["role"], "stem");
+    assert_valid_against_schema(&manifest);
+}
+
+#[test]
+fn add_id_flag_overrides_the_minted_slug() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav", "--id", "lead-vox"]);
+    assert!(output.status.success());
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["assets"][0]["id"], "lead-vox");
+    assert_valid_against_schema(&manifest);
+}
+
+#[test]
+fn add_disambiguates_colliding_slugs_with_a_numeric_suffix() {
+    let dir = init_project();
+    fs::create_dir(dir.path().join("take1")).unwrap();
+    fs::create_dir(dir.path().join("take2")).unwrap();
+    fs::write(dir.path().join("take1/vocals.wav"), b"hello").unwrap();
+    fs::write(dir.path().join("take2/vocals.wav"), b"world").unwrap();
+
+    assert!(run(dir.path(), &["add", "take1/vocals.wav"])
+        .status
+        .success());
+    assert!(run(dir.path(), &["add", "take2/vocals.wav"])
+        .status
+        .success());
+
+    let manifest = read_manifest(dir.path());
+    let ids: Vec<&str> = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["vocals", "vocals-2"]);
+    let paths: Vec<&str> = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["take1/vocals.wav", "take2/vocals.wav"]);
+    assert_valid_against_schema(&manifest);
+}
+
+#[test]
+fn add_refuses_an_already_registered_path_naming_the_existing_asset() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav", "--id", "first"])
+        .status
+        .success());
+
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let output = run(dir.path(), &["add", "song.wav"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("already registered"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("first"),
+        "stderr should name the asset: {stderr}"
+    );
+
+    // Manifest byte-identical to before the refused add.
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn add_refuses_a_missing_file_leaving_the_manifest_untouched() {
+    let dir = init_project();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["add", "nope.wav"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn add_refuses_an_invalid_id() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav", "--id", "Bad Id"]);
+    assert!(!output.status.success());
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn add_refuses_when_the_directory_is_not_a_project() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+    assert!(!output.status.success());
+    assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+}

@@ -3,10 +3,11 @@
 //! The CLI parses arguments and formats output; the core crate owns manifest
 //! semantics. Errors go to stderr; a failed command exits non-zero.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{init, tagline};
+use uncompose_project_core::{add, init, tagline, DEFAULT_ROLE};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version)]
@@ -23,6 +24,17 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Register a file as an asset, recording its sha256, size, and path.
+    Add {
+        /// File to register, relative to the project root.
+        path: PathBuf,
+        /// Asset id (auto-minted from the filename stem by default).
+        #[arg(long)]
+        id: Option<String>,
+        /// What the asset is for; open vocabulary (e.g. mix, stem, reference).
+        #[arg(long, default_value = DEFAULT_ROLE)]
+        role: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -32,6 +44,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Command::Init { name }) => run_init(name),
+        Some(Command::Add { path, id, role }) => run_add(path, id, role),
     }
 }
 
@@ -61,6 +74,29 @@ fn run_init(name: Option<String>) -> ExitCode {
             println!(
                 "Initialized uncompose project '{name}' ({})",
                 path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_add(path: PathBuf, id: Option<String>, role: String) -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("error: cannot determine the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match add(&root, &path, id.as_deref(), &role) {
+        Ok(asset) => {
+            println!(
+                "Added asset '{}' ({}, {} bytes, role {})",
+                asset.id, asset.path, asset.size, asset.role
             );
             ExitCode::SUCCESS
         }
