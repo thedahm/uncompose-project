@@ -323,7 +323,8 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
         }
     };
 
-    let (sha256, size) = hash_file(root, rel)?;
+    let (sha256, size) =
+        sha256_file(&root.join(rel)).map_err(|e| AddError::Unreadable(rel.to_path_buf(), e))?;
 
     let asset = Asset {
         id,
@@ -384,7 +385,7 @@ pub enum VerifyError {
     /// The manifest could not be read/parsed (see [`LoadError`]).
     Load(LoadError),
     /// An asset's file exists but could not be read to hash it (permissions, a
-    /// directory). A missing file is a [`Integrity::Missing`] status, not this.
+    /// directory). A missing file is an [`Integrity::Missing`] status, not this.
     Unreadable(PathBuf, io::Error),
     /// Rewriting the manifest with refreshed `last_verified` timestamps failed.
     Io(io::Error),
@@ -461,10 +462,8 @@ fn check_integrity(root: &Path, asset: &Asset) -> Result<Integrity, VerifyError>
         return Ok(Integrity::Modified);
     }
 
-    let mut file = File::open(&path).map_err(|e| VerifyError::Unreadable(path.clone(), e))?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher).map_err(|e| VerifyError::Unreadable(path.clone(), e))?;
-    if hex_digest(&hasher.finalize()) == asset.sha256 {
+    let (sha256, _) = sha256_file(&path).map_err(|e| VerifyError::Unreadable(path, e))?;
+    if sha256 == asset.sha256 {
         Ok(Integrity::Verified)
     } else {
         Ok(Integrity::Modified)
@@ -522,20 +521,19 @@ fn resolve_inside_root(root: &Path, rel: &Path) -> Result<String, AddError> {
     Ok(stored)
 }
 
-/// Stream the file at `root/rel` into a SHA-256 hasher, returning its lowercase
-/// hex digest and byte length over the exact bytes on disk.
-fn hash_file(root: &Path, rel: &Path) -> Result<(String, u64), AddError> {
-    let path = root.join(rel);
-    let mut file = File::open(&path).map_err(|e| AddError::Unreadable(rel.to_path_buf(), e))?;
+/// Stream the file at `path` into a SHA-256 hasher, returning its lowercase hex
+/// digest — the manifest's sha256 form — and byte length over the exact bytes on
+/// disk.
+fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
+    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let size =
-        io::copy(&mut file, &mut hasher).map_err(|e| AddError::Unreadable(rel.to_path_buf(), e))?;
-    Ok((hex_digest(&hasher.finalize()), size))
-}
-
-/// Render a digest as lowercase hex — the manifest's sha256 form.
-fn hex_digest(digest: &[u8]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    let size = io::copy(&mut file, &mut hasher)?;
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((hex, size))
 }
 
 /// A character the schema slug pattern allows at the start: `[a-z0-9]`.
