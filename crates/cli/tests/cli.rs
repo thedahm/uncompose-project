@@ -36,16 +36,18 @@ fn assert_valid_against_schema(manifest: &Value) {
 }
 
 #[test]
-fn prints_the_banner_and_exits_zero() {
+fn bare_invocation_prints_usage_and_exits_nonzero() {
+    // No subcommand is not a success: the spec defines four subcommands plus
+    // --version/--help, and a script that ran nothing should not see exit 0.
     let dir = TempDir::new().unwrap();
     let output = run(dir.path(), &[]);
 
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("uncompose-project — {}\n", tagline())
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Usage:"),
+        "bare invocation should show usage: {stderr}"
     );
-    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -77,6 +79,10 @@ fn help_flag_prints_usage_and_commands() {
     assert!(
         stdout.contains("init"),
         "help should list the init command: {stdout}"
+    );
+    assert!(
+        stdout.contains(tagline()),
+        "help should carry the tool's one-line description: {stdout}"
     );
     assert!(output.stderr.is_empty());
 }
@@ -422,6 +428,93 @@ fn add_refuses_a_manifest_with_an_unknown_field_naming_it() {
     assert_eq!(
         fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
         with_unknown
+    );
+}
+
+/// Strict reads reach inside `derivations[]` too: an unknown field on a
+/// derivation is rejected, never carried and re-emitted (uncompose#64,
+/// `additionalProperties: false` outside `ext`).
+#[test]
+fn show_refuses_a_derivation_with_an_unknown_field() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [\n    {{\n      \"id\": \"split-1\",\n      \"inputs\": [\"a\"],\n      \"outputs\": [\"b\"],\n      \"tool\": \"demucs\",\n      \"created_at\": \"2020-01-02T00:00:00Z\",\n      \"totally_unknown\": true\n    }}\n  ],\n  \"evaluations\": []\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(
+        !output.status.success(),
+        "an off-shape derivation should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("totally_unknown"),
+        "error should name the offending field: {stderr}"
+    );
+}
+
+/// A derivation missing a required field (here `tool`) is off-shape, not
+/// best-effort-rendered.
+#[test]
+fn show_refuses_a_derivation_missing_a_required_field() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [\n    {{\n      \"id\": \"split-1\",\n      \"inputs\": [\"a\"],\n      \"outputs\": [\"b\"],\n      \"created_at\": \"2020-01-02T00:00:00Z\"\n    }}\n  ],\n  \"evaluations\": []\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(
+        !output.status.success(),
+        "a derivation without `tool` should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("tool"),
+        "error should name the missing field: {stderr}"
+    );
+}
+
+/// `ext` keys are namespace slugs (uncompose#64). A key outside the slug
+/// pattern is rejected so the tool never re-emits a manifest the published
+/// schema fails.
+#[test]
+fn show_refuses_an_ext_key_that_is_not_a_namespace_slug() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\", \"ext\": {{ \"Bad Key\": 1 }} }},\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": []\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(!output.status.success(), "a non-slug ext key should refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Bad Key"),
+        "error should name the offending key: {stderr}"
+    );
+}
+
+/// `ext` must be an object; a scalar there is off-shape, not opaque data.
+#[test]
+fn show_refuses_an_ext_that_is_not_an_object() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": [],\n  \"ext\": 5\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(!output.status.success(), "a scalar ext should refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("does not conform to schema v0"),
+        "error should say the manifest is off-shape: {stderr}"
     );
 }
 

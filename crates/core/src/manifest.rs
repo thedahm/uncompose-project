@@ -2,10 +2,9 @@
 //! `init`/`add` operations that write it atomically.
 //!
 //! Only what M1's commands need is modeled here. `init` mints an empty manifest
-//! and `add` registers assets; derivations and evaluations are part of schema v0
-//! (see the in-repo JSON Schema) but no M1 command populates them, so their
-//! collections round-trip as opaque JSON until the import work that owns them
-//! lands.
+//! and `add` registers assets; no M1 command creates derivations or evaluations,
+//! but both are parsed strictly against schema v0 and round-tripped, so an
+//! off-shape record is rejected rather than silently carried and re-emitted.
 //!
 //! Reads are strict: the manifest's `schema` URL is matched exactly against
 //! [`SCHEMA_URL`] and any plain field outside the v0 shape is rejected, so the
@@ -19,7 +18,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -48,10 +47,12 @@ pub struct Manifest {
     pub schema: String,
     pub project: Project,
     pub assets: Vec<Asset>,
-    pub derivations: Vec<Value>,
-    pub evaluations: Vec<Value>,
+    pub derivations: Vec<Derivation>,
+    /// Reserved: the item shape is owned by uncompose#63 (M2 import). Until then
+    /// any object round-trips; a non-object item is rejected per the schema.
+    pub evaluations: Vec<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
+    pub ext: Option<Map<String, Value>>,
 }
 
 /// The `project` object: identity minted once at init.
@@ -62,7 +63,7 @@ pub struct Project {
     pub name: String,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
+    pub ext: Option<Map<String, Value>>,
 }
 
 /// A file registered into the project. Its identity is its `sha256` + `size` over
@@ -83,7 +84,40 @@ pub struct Asset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
+    pub ext: Option<Map<String, Value>>,
+}
+
+/// A recorded transformation — inputs to outputs by a tool. No M1 command
+/// creates one; they are read, shown, and round-tripped, held to the same strict
+/// v0 shape as everything else so the tool never rewrites a manifest the
+/// published schema rejects. Field order matches the schema's canonical order.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Derivation {
+    pub id: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<String>,
+    /// Opaque to the schema; owned by the tool that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Map<String, Value>>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Map<String, Value>>,
+}
+
+/// A hashed reference to an imported job.json — referenced, never absorbed.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Job {
+    pub path: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Map<String, Value>>,
 }
 
 impl Manifest {
@@ -183,6 +217,8 @@ pub enum LoadError {
     /// v0 shape — an unknown plain field (outside `ext`), a missing required field,
     /// or a wrong type. The wrapped error names the offending field.
     Invalid(serde_json::Error),
+    /// An `ext` object carries a key that is not a namespace slug (uncompose#64).
+    InvalidExtKey { owner: String, key: String },
 }
 
 impl std::fmt::Display for LoadError {
@@ -208,6 +244,10 @@ impl std::fmt::Display for LoadError {
             LoadError::Invalid(e) => {
                 write!(f, "the manifest does not conform to schema v0: {e}")
             }
+            LoadError::InvalidExtKey { owner, key } => write!(
+                f,
+                "ext key '{key}' on {owner} is not a namespace slug (lowercase letters, digits, '.', '_', '-'; must start with a letter or digit)"
+            ),
         }
     }
 }
@@ -495,8 +535,7 @@ pub fn show(root: &Path) -> Result<ShowOutput, LoadError> {
 
 /// Render a manifest as a human-readable overview: the project header, then the
 /// assets and derivations, each with a count so an empty collection is shown
-/// explicitly rather than silently omitted. Derivations are read from their
-/// opaque JSON (no M1 command models them) by pulling the schema v0 fields.
+/// explicitly rather than silently omitted.
 fn render_overview(m: &Manifest) -> String {
     use std::fmt::Write;
     let mut o = String::new();
@@ -530,38 +569,18 @@ fn render_overview(m: &Manifest) -> String {
     o
 }
 
-/// Render one derivation from its opaque JSON value, reading the schema v0 fields
-/// (`id`, `tool`, optional `tool_version`, `inputs`, `outputs`, `created_at`).
-/// Missing or off-type fields degrade to a placeholder rather than panicking, so
-/// `show` stays a read-only view.
-fn render_derivation(o: &mut String, d: &Value) {
+/// Render one derivation: id and tool header, then inputs, outputs, and when it
+/// was created.
+fn render_derivation(o: &mut String, d: &Derivation) {
     use std::fmt::Write;
-    let str_field = |key: &str| d.get(key).and_then(Value::as_str);
-    let id = str_field("id").unwrap_or("?");
-    let tool = str_field("tool").unwrap_or("?");
-    let tool_label = match str_field("tool_version") {
-        Some(version) => format!("{tool} v{version}"),
-        None => tool.to_string(),
+    let tool_label = match &d.tool_version {
+        Some(version) => format!("{} v{version}", d.tool),
+        None => d.tool.clone(),
     };
-    let _ = writeln!(o, "  {id}  ({tool_label})");
-    let _ = writeln!(o, "    inputs:  {}", join_slugs(d.get("inputs")));
-    let _ = writeln!(o, "    outputs: {}", join_slugs(d.get("outputs")));
-    if let Some(created) = str_field("created_at") {
-        let _ = writeln!(o, "    created: {created}");
-    }
-}
-
-/// Comma-join a JSON array of slug strings, ignoring any non-string entries.
-fn join_slugs(v: Option<&Value>) -> String {
-    v.and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default()
+    let _ = writeln!(o, "  {}  ({tool_label})", d.id);
+    let _ = writeln!(o, "    inputs:  {}", d.inputs.join(", "));
+    let _ = writeln!(o, "    outputs: {}", d.outputs.join(", "));
+    let _ = writeln!(o, "    created: {}", d.created_at);
 }
 
 /// Read and strictly parse the manifest at `root`, returning both the exact file
@@ -587,8 +606,40 @@ fn load_manifest(root: &Path) -> Result<(Vec<u8>, Manifest), LoadError> {
             found: found.map(str::to_string),
         });
     }
-    let manifest = serde_json::from_value(value).map_err(LoadError::Invalid)?;
+    let manifest: Manifest = serde_json::from_value(value).map_err(LoadError::Invalid)?;
+    validate_ext_keys(&manifest)?;
     Ok((bytes, manifest))
+}
+
+/// Enforce the one rule `ext` subtrees have: keys are namespace slugs
+/// (uncompose#64). Values stay opaque. Serde cannot express a key pattern, so
+/// this runs as a post-parse walk over every object that may carry `ext`.
+fn validate_ext_keys(manifest: &Manifest) -> Result<(), LoadError> {
+    check_ext("the manifest", manifest.ext.as_ref())?;
+    check_ext("project", manifest.project.ext.as_ref())?;
+    for a in &manifest.assets {
+        check_ext(&format!("asset '{}'", a.id), a.ext.as_ref())?;
+    }
+    for d in &manifest.derivations {
+        check_ext(&format!("derivation '{}'", d.id), d.ext.as_ref())?;
+        if let Some(job) = &d.job {
+            check_ext(&format!("derivation '{}' job", d.id), job.ext.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+/// Check one `ext` object's keys against the slug pattern.
+fn check_ext(owner: &str, ext: Option<&Map<String, Value>>) -> Result<(), LoadError> {
+    if let Some(map) = ext {
+        if let Some(key) = map.keys().find(|k| !is_valid_slug(k)) {
+            return Err(LoadError::InvalidExtKey {
+                owner: owner.to_string(),
+                key: key.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve `rel` against `root` and return its root-relative, forward-slash path,

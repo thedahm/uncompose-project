@@ -6,8 +6,8 @@
 pub mod manifest;
 
 pub use manifest::{
-    add, init, show, verify, AddError, Asset, AssetStatus, InitError, Integrity, LoadError,
-    Manifest, Project, ShowOutput, VerifyError, VerifyReport, DEFAULT_ROLE, SCHEMA_URL,
+    add, init, show, verify, AddError, Asset, AssetStatus, Derivation, InitError, Integrity, Job,
+    LoadError, Manifest, Project, ShowOutput, VerifyError, VerifyReport, DEFAULT_ROLE, SCHEMA_URL,
 };
 
 /// The fixed name of the project manifest at the root of an uncompose project.
@@ -22,11 +22,6 @@ pub fn tagline() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn manifest_filename_is_fixed() {
-        assert_eq!(MANIFEST_FILENAME, "uncompose.project.json");
-    }
 
     #[test]
     fn tagline_is_non_empty() {

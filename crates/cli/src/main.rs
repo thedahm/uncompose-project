@@ -11,10 +11,10 @@ use clap::{Parser, Subcommand};
 use uncompose_project_core::{add, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
 
 #[derive(Parser)]
-#[command(name = "uncompose-project", version)]
+#[command(name = "uncompose-project", version, about = tagline(), arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -48,14 +48,10 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        None => {
-            println!("uncompose-project — {}", tagline());
-            ExitCode::SUCCESS
-        }
-        Some(Command::Init { name }) => run_init(name),
-        Some(Command::Add { path, id, role }) => run_add(path, id, role),
-        Some(Command::Verify) => run_verify(),
-        Some(Command::Show { json }) => run_show(json),
+        Command::Init { name } => run_init(name),
+        Command::Add { path, id, role } => run_add(path, id, role),
+        Command::Verify => run_verify(),
+        Command::Show { json } => run_show(json),
     }
 }
 
@@ -149,7 +145,13 @@ fn run_show(json: bool) -> ExitCode {
     match show(&root) {
         Ok(out) => {
             if json {
-                let _ = std::io::stdout().write_all(&out.raw);
+                // A short write here (closed pipe, full disk) must not exit 0:
+                // scripts trust `show --json > copy` to be the whole manifest.
+                let mut stdout = std::io::stdout();
+                if let Err(e) = stdout.write_all(&out.raw).and_then(|()| stdout.flush()) {
+                    eprintln!("error: failed to write the manifest to stdout: {e}");
+                    return ExitCode::FAILURE;
+                }
             } else {
                 print!("{}", out.overview);
             }
