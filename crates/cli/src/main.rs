@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{init, tagline, InitError};
+use uncompose_project_core::{init, tagline};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version)]
@@ -64,11 +64,7 @@ fn run_init(name: Option<String>) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(e @ InitError::AlreadyExists(_)) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-        Err(e @ InitError::Io(_)) => {
+        Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
