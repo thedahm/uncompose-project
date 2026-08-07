@@ -122,7 +122,7 @@ fn init_refuses_when_a_manifest_already_exists() {
     assert_eq!(fs::read_to_string(&manifest).unwrap(), sentinel);
 }
 
-/// sha256 of the bytes `b"hello"`; size 5. Used across the add tests.
+/// sha256 of the bytes `b"hello"`; size 5.
 const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
 /// Initialize a project in a fresh temp dir and return it.
@@ -207,19 +207,10 @@ fn add_disambiguates_colliding_slugs_with_a_numeric_suffix() {
         .success());
 
     let manifest = read_manifest(dir.path());
-    let ids: Vec<&str> = manifest["assets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["id"].as_str().unwrap())
-        .collect();
+    let assets = manifest["assets"].as_array().unwrap();
+    let ids: Vec<&str> = assets.iter().map(|a| a["id"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["vocals", "vocals-2"]);
-    let paths: Vec<&str> = manifest["assets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["path"].as_str().unwrap())
-        .collect();
+    let paths: Vec<&str> = assets.iter().map(|a| a["path"].as_str().unwrap()).collect();
     assert_eq!(paths, vec!["take1/vocals.wav", "take2/vocals.wav"]);
     assert_valid_against_schema(&manifest);
 }

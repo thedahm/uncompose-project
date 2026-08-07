@@ -48,13 +48,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_init(name: Option<String>) -> ExitCode {
-    let root = match std::env::current_dir() {
-        Ok(dir) => dir,
+/// The project root every command operates on: the current directory. Reports
+/// on stderr and returns `None` when it cannot be determined.
+fn project_root() -> Option<PathBuf> {
+    match std::env::current_dir() {
+        Ok(dir) => Some(dir),
         Err(e) => {
             eprintln!("error: cannot determine the current directory: {e}");
-            return ExitCode::FAILURE;
+            None
         }
+    }
+}
+
+fn run_init(name: Option<String>) -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
     };
     let name = match name {
         Some(name) => name,
@@ -85,12 +93,8 @@ fn run_init(name: Option<String>) -> ExitCode {
 }
 
 fn run_add(path: PathBuf, id: Option<String>, role: String) -> ExitCode {
-    let root = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("error: cannot determine the current directory: {e}");
-            return ExitCode::FAILURE;
-        }
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
     };
     match add(&root, &path, id.as_deref(), &role) {
         Ok(asset) => {

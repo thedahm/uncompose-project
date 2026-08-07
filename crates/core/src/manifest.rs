@@ -209,7 +209,7 @@ impl std::error::Error for AddError {}
 /// a missing/unreadable file, an already-registered path, or an invalid/taken id.
 pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asset, AddError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
-    let mut manifest = load(&manifest_path, root)?;
+    let mut manifest = load_manifest(root)?;
 
     if !is_valid_slug(role) {
         return Err(AddError::InvalidSlug {
@@ -264,15 +264,16 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     Ok(asset)
 }
 
-/// Read and parse the manifest at `manifest_path`. A missing manifest means the
+/// Read and parse the manifest at `root`. A missing manifest means the
 /// directory is not a project.
-fn load(manifest_path: &Path, root: &Path) -> Result<Manifest, AddError> {
-    let bytes = match std::fs::read(manifest_path) {
+fn load_manifest(root: &Path) -> Result<Manifest, AddError> {
+    let manifest_path = root.join(MANIFEST_FILENAME);
+    let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(AddError::NotAProject(root.to_path_buf()))
         }
-        Err(e) => return Err(AddError::Unreadable(manifest_path.to_path_buf(), e)),
+        Err(e) => return Err(AddError::Unreadable(manifest_path, e)),
     };
     serde_json::from_slice(&bytes).map_err(AddError::Parse)
 }
@@ -316,14 +317,20 @@ fn hash_file(root: &Path, rel: &Path) -> Result<(String, u64), AddError> {
     Ok((hex, size))
 }
 
+/// A character the schema slug pattern allows at the start: `[a-z0-9]`.
+fn is_slug_start(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit()
+}
+
+/// A character the schema slug pattern allows after the start: `[a-z0-9._-]`.
+fn is_slug_char(c: char) -> bool {
+    is_slug_start(c) || matches!(c, '.' | '_' | '-')
+}
+
 /// Whether `s` matches the schema slug pattern `^[a-z0-9][a-z0-9._-]*$`.
 fn is_valid_slug(s: &str) -> bool {
     let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    matches!(chars.next(), Some(c) if is_slug_start(c)) && chars.all(is_slug_char)
 }
 
 /// Lowercase and sanitize `stem` into a slug: disallowed characters become `-`,
@@ -333,14 +340,10 @@ fn slugify(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len());
     for c in stem.chars() {
         let lc = c.to_ascii_lowercase();
-        if lc.is_ascii_lowercase() || lc.is_ascii_digit() || matches!(lc, '.' | '_' | '-') {
-            out.push(lc);
-        } else {
-            out.push('-');
-        }
+        out.push(if is_slug_char(lc) { lc } else { '-' });
     }
     let trimmed = out
-        .trim_start_matches(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
+        .trim_start_matches(|c: char| !is_slug_start(c))
         .trim_end_matches('-');
     if trimmed.is_empty() {
         "asset".to_string()
