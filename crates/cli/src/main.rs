@@ -7,21 +7,5 @@
 use uncompose_project_core::tagline;
 
 fn main() {
-    println!("{}", banner());
-}
-
-/// The startup banner, kept as a pure function so it is testable without
-/// spawning the process.
-fn banner() -> String {
-    format!("uncompose-project — {}", tagline())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn banner_mentions_the_tool() {
-        assert!(banner().starts_with("uncompose-project"));
-    }
+    println!("uncompose-project — {}", tagline());
 }
