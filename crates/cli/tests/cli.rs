@@ -425,6 +425,149 @@ fn add_refuses_a_manifest_with_an_unknown_field_naming_it() {
     );
 }
 
+// --- M1.4: show, human overview and --json ---
+
+#[test]
+fn show_prints_a_human_overview_of_an_empty_project() {
+    let dir = TempDir::new().unwrap();
+    assert!(run(dir.path(), &["init", "--name", "demo"])
+        .status
+        .success());
+
+    let output = run(dir.path(), &["show"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("demo"), "should name the project: {stdout}");
+    // Zero assets and derivations are shown explicitly, not silently omitted.
+    assert!(stdout.contains("Assets (0)"), "{stdout}");
+    assert!(stdout.contains("Derivations (0)"), "{stdout}");
+}
+
+#[test]
+fn show_lists_assets_with_id_path_role_and_hash() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav", "--role", "stem"])
+        .status
+        .success());
+
+    let output = run(dir.path(), &["show"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Assets (1)"), "{stdout}");
+    assert!(
+        stdout.contains("song"),
+        "should show the asset id: {stdout}"
+    );
+    assert!(
+        stdout.contains("song.wav"),
+        "should show the path: {stdout}"
+    );
+    assert!(stdout.contains("stem"), "should show the role: {stdout}");
+    assert!(
+        stdout.contains(HELLO_SHA256),
+        "should show the sha256: {stdout}"
+    );
+}
+
+/// `derivations[]` has no M1 command that creates one, but a hand-authored
+/// manifest (valid per schema v0) carrying one must render in `show`.
+#[test]
+fn show_renders_a_hand_authored_derivation() {
+    let dir = TempDir::new().unwrap();
+    let seed = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3NDEKTSV4RRFFQ69G5FAV\", \"name\": \"demo\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [\n    {{\n      \"id\": \"split-1\",\n      \"inputs\": [\"source-mix\"],\n      \"outputs\": [\"lead-vox\", \"drums\"],\n      \"tool\": \"demucs\",\n      \"tool_version\": \"4.0\",\n      \"created_at\": \"2020-01-02T00:00:00Z\"\n    }}\n  ],\n  \"evaluations\": []\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &seed).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Derivations (1)"), "{stdout}");
+    assert!(stdout.contains("split-1"), "derivation id: {stdout}");
+    assert!(stdout.contains("demucs"), "tool: {stdout}");
+    assert!(stdout.contains("4.0"), "tool_version: {stdout}");
+    assert!(stdout.contains("source-mix"), "input slug: {stdout}");
+    assert!(stdout.contains("lead-vox"), "output slug: {stdout}");
+    assert!(stdout.contains("drums"), "output slug: {stdout}");
+}
+
+#[test]
+fn show_json_is_byte_identical_to_the_manifest_file() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+
+    let file_bytes = fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let output = run(dir.path(), &["show", "--json"]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout, file_bytes,
+        "show --json must be byte-identical to the manifest file"
+    );
+}
+
+/// `--json` emits the file verbatim, not a re-serialization: a deliberately
+/// non-canonical (compact) manifest comes back byte-for-byte unchanged.
+#[test]
+fn show_json_emits_a_hand_authored_manifest_verbatim() {
+    let dir = TempDir::new().unwrap();
+    let seed = format!(
+        "{{\"schema\":\"{SCHEMA_URL}\",\"project\":{{\"id\":\"01ARZ3\",\"name\":\"x\",\"created_at\":\"2020-01-01T00:00:00Z\"}},\"assets\":[],\"derivations\":[],\"evaluations\":[]}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &seed).unwrap();
+
+    let output = run(dir.path(), &["show", "--json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), seed);
+}
+
+#[test]
+fn show_refuses_when_the_directory_is_not_a_project() {
+    let dir = TempDir::new().unwrap();
+    let output = run(dir.path(), &["show"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not an uncompose project"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `show` uses the same strict read as `add`: an unrecognized `schema` URL is
+/// refused, never best-effort-rendered (uncompose#64).
+#[test]
+fn show_refuses_a_manifest_whose_schema_url_is_not_the_recognized_v0() {
+    let dir = TempDir::new().unwrap();
+    let bogus = "{\n  \"schema\": \"https://uncompose.org/schemas/project/v99/uncompose.project.schema.json\",\n  \"project\": { \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" },\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": []\n}\n";
+    fs::write(dir.path().join(MANIFEST_FILENAME), bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("schema") && stderr.contains(SCHEMA_URL),
+        "stderr: {stderr}"
+    );
+}
+
 /// Named conformance test (uncompose#64): `ext` blobs at project, asset, and
 /// derivation level survive a rewriting command (`add`) verbatim.
 #[test]

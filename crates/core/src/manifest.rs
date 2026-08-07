@@ -163,8 +163,9 @@ pub fn init(root: &Path, name: &str) -> Result<PathBuf, InitError> {
 }
 
 /// Why a manifest could not be read and strictly parsed. Shared by every command
-/// that reads before it writes (`add`, `verify`), so the strict-read policy lives
-/// in one place. Every variant is raised before any write, leaving the manifest
+/// that reads the manifest before acting (`add`, `verify`, `show`), so the
+/// strict-read policy lives in one place; each command maps these into its own
+/// error type. Every variant is raised before any write, leaving the manifest
 /// byte-identical.
 #[derive(Debug)]
 pub enum LoadError {
@@ -285,7 +286,7 @@ impl From<LoadError> for AddError {
 /// a missing/unreadable file, an already-registered path, or an invalid/taken id.
 pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asset, AddError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
-    let mut manifest = load_manifest(root)?;
+    let (_, mut manifest) = load_manifest(root)?;
 
     if !is_valid_slug(role) {
         return Err(AddError::InvalidSlug {
@@ -417,7 +418,7 @@ impl From<LoadError> for VerifyError {
 /// project or the manifest does not conform.
 pub fn verify(root: &Path) -> Result<VerifyReport, VerifyError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
-    let mut manifest = load_manifest(root)?;
+    let (_, mut manifest) = load_manifest(root)?;
     let now = now_rfc3339();
 
     let mut statuses = Vec::with_capacity(manifest.assets.len());
@@ -470,13 +471,107 @@ fn check_integrity(root: &Path, asset: &Asset) -> Result<Integrity, VerifyError>
     }
 }
 
-/// Read and strictly parse the manifest at `root`. A missing manifest means the
-/// directory is not a project. The read never best-effort-parses a manifest this
-/// tool does not own: the `schema` URL must match `SCHEMA_URL` exactly, and any
-/// plain field outside the v0 shape (i.e. not `ext`) is rejected. The `schema`
-/// check runs first so an unrecognized manifest reports the version mismatch
-/// rather than incidental shape errors.
-fn load_manifest(root: &Path) -> Result<Manifest, LoadError> {
+/// The result of `show`: the manifest's exact file bytes (for `--json`) and a
+/// human-readable overview of the project, its assets, and its derivations.
+pub struct ShowOutput {
+    /// The manifest file's bytes, verbatim — emitted unchanged by `show --json`.
+    pub raw: Vec<u8>,
+    /// A human-readable overview, ending in a newline.
+    pub overview: String,
+}
+
+/// Read the project at `root` (strictly, like `add`) and render it for `show`.
+/// Returns the manifest's exact bytes alongside a human overview; the caller
+/// picks which to print. Refuses a missing, unparsable, wrong-schema, or
+/// off-shape manifest — `show` never best-effort-renders a manifest it does not
+/// own.
+pub fn show(root: &Path) -> Result<ShowOutput, LoadError> {
+    let (raw, manifest) = load_manifest(root)?;
+    Ok(ShowOutput {
+        raw,
+        overview: render_overview(&manifest),
+    })
+}
+
+/// Render a manifest as a human-readable overview: the project header, then the
+/// assets and derivations, each with a count so an empty collection is shown
+/// explicitly rather than silently omitted. Derivations are read from their
+/// opaque JSON (no M1 command models them) by pulling the schema v0 fields.
+fn render_overview(m: &Manifest) -> String {
+    use std::fmt::Write;
+    let mut o = String::new();
+
+    let _ = writeln!(o, "Project: {}", m.project.name);
+    let _ = writeln!(o, "  id:      {}", m.project.id);
+    let _ = writeln!(o, "  created: {}", m.project.created_at);
+    o.push('\n');
+
+    if m.assets.is_empty() {
+        let _ = writeln!(o, "Assets (0): none");
+    } else {
+        let _ = writeln!(o, "Assets ({}):", m.assets.len());
+        for a in &m.assets {
+            let _ = writeln!(o, "  {}  {}  ({}, {} bytes)", a.id, a.path, a.role, a.size);
+            let _ = writeln!(o, "    sha256: {}", a.sha256);
+            let _ = writeln!(o, "    added:  {}", a.added_at);
+        }
+    }
+    o.push('\n');
+
+    if m.derivations.is_empty() {
+        let _ = writeln!(o, "Derivations (0): none");
+    } else {
+        let _ = writeln!(o, "Derivations ({}):", m.derivations.len());
+        for d in &m.derivations {
+            render_derivation(&mut o, d);
+        }
+    }
+
+    o
+}
+
+/// Render one derivation from its opaque JSON value, reading the schema v0 fields
+/// (`id`, `tool`, optional `tool_version`, `inputs`, `outputs`, `created_at`).
+/// Missing or off-type fields degrade to a placeholder rather than panicking, so
+/// `show` stays a read-only view.
+fn render_derivation(o: &mut String, d: &Value) {
+    use std::fmt::Write;
+    let str_field = |key: &str| d.get(key).and_then(Value::as_str);
+    let id = str_field("id").unwrap_or("?");
+    let tool = str_field("tool").unwrap_or("?");
+    let tool_label = match str_field("tool_version") {
+        Some(version) => format!("{tool} v{version}"),
+        None => tool.to_string(),
+    };
+    let _ = writeln!(o, "  {id}  ({tool_label})");
+    let _ = writeln!(o, "    inputs:  {}", join_slugs(d.get("inputs")));
+    let _ = writeln!(o, "    outputs: {}", join_slugs(d.get("outputs")));
+    if let Some(created) = str_field("created_at") {
+        let _ = writeln!(o, "    created: {created}");
+    }
+}
+
+/// Comma-join a JSON array of slug strings, ignoring any non-string entries.
+fn join_slugs(v: Option<&Value>) -> String {
+    v.and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Read and strictly parse the manifest at `root`, returning both the exact file
+/// bytes (so a command can re-emit them verbatim) and the parsed manifest. A
+/// missing manifest means the directory is not a project. The read never
+/// best-effort-parses a manifest this tool does not own: the `schema` URL must
+/// match `SCHEMA_URL` exactly, and any plain field outside the v0 shape (i.e. not
+/// `ext`) is rejected. The `schema` check runs first so an unrecognized manifest
+/// reports the version mismatch rather than incidental shape errors.
+fn load_manifest(root: &Path) -> Result<(Vec<u8>, Manifest), LoadError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
@@ -492,7 +587,8 @@ fn load_manifest(root: &Path) -> Result<Manifest, LoadError> {
             found: found.map(str::to_string),
         });
     }
-    serde_json::from_value(value).map_err(LoadError::Invalid)
+    let manifest = serde_json::from_value(value).map_err(LoadError::Invalid)?;
+    Ok((bytes, manifest))
 }
 
 /// Resolve `rel` against `root` and return its root-relative, forward-slash path,

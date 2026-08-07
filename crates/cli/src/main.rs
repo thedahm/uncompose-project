@@ -3,11 +3,12 @@
 //! The CLI parses arguments and formats output; the core crate owns manifest
 //! semantics. Errors go to stderr; a failed command exits non-zero.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, init, tagline, verify, Integrity, DEFAULT_ROLE};
+use uncompose_project_core::{add, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version)]
@@ -37,6 +38,12 @@ enum Command {
     },
     /// Check that each registered file still matches its recorded identity.
     Verify,
+    /// Print a readable overview of the project, its assets, and derivations.
+    Show {
+        /// Emit the manifest verbatim as JSON instead of the human overview.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -48,6 +55,7 @@ fn main() -> ExitCode {
         Some(Command::Init { name }) => run_init(name),
         Some(Command::Add { path, id, role }) => run_add(path, id, role),
         Some(Command::Verify) => run_verify(),
+        Some(Command::Show { json }) => run_show(json),
     }
 }
 
@@ -129,6 +137,28 @@ fn run_verify() -> ExitCode {
     } else {
         eprintln!("error: verification failed: {modified} modified, {missing} missing");
         ExitCode::FAILURE
+    }
+}
+
+/// Print the project overview, or with `--json` the manifest bytes verbatim
+/// (byte-identical to the file, for scripts and pipelines).
+fn run_show(json: bool) -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
+    };
+    match show(&root) {
+        Ok(out) => {
+            if json {
+                let _ = std::io::stdout().write_all(&out.raw);
+            } else {
+                print!("{}", out.overview);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
