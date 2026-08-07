@@ -404,14 +404,11 @@ fn render_derivation(o: &mut String, d: &Value) {
     let str_field = |key: &str| d.get(key).and_then(Value::as_str);
     let id = str_field("id").unwrap_or("?");
     let tool = str_field("tool").unwrap_or("?");
-    match str_field("tool_version") {
-        Some(v) => {
-            let _ = writeln!(o, "  {id}  ({tool} v{v})");
-        }
-        None => {
-            let _ = writeln!(o, "  {id}  ({tool})");
-        }
-    }
+    let tool_label = match str_field("tool_version") {
+        Some(version) => format!("{tool} v{version}"),
+        None => tool.to_string(),
+    };
+    let _ = writeln!(o, "  {id}  ({tool_label})");
     let _ = writeln!(o, "    inputs:  {}", join_slugs(d.get("inputs")));
     let _ = writeln!(o, "    outputs: {}", join_slugs(d.get("outputs")));
     if let Some(created) = str_field("created_at") {

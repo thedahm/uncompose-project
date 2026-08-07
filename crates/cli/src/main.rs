@@ -3,10 +3,9 @@
 //! The CLI parses arguments and formats output; the core crate owns manifest
 //! semantics. Errors go to stderr; a failed command exits non-zero.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-use std::io::Write;
 
 use clap::{Parser, Subcommand};
 use uncompose_project_core::{add, init, show, tagline, DEFAULT_ROLE};
@@ -110,7 +109,6 @@ fn run_show(json: bool) -> ExitCode {
     match show(&root) {
         Ok(out) => {
             if json {
-                // Write the raw bytes unchanged; `print!` would re-encode.
                 let _ = std::io::stdout().write_all(&out.raw);
             } else {
                 print!("{}", out.overview);
