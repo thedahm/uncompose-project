@@ -49,6 +49,100 @@ fn prints_the_banner_and_exits_zero() {
 }
 
 #[test]
+fn version_flag_prints_name_and_version() {
+    // ADR-0005 dispatch contract: the delegated binary must answer `--version`.
+    let dir = TempDir::new().unwrap();
+    let output = run(dir.path(), &["--version"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("uncompose-project {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn help_flag_prints_usage_and_commands() {
+    // ADR-0005 dispatch contract: the delegated binary must answer `--help`.
+    let dir = TempDir::new().unwrap();
+    let output = run(dir.path(), &["--help"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Usage:"),
+        "help should show usage: {stdout}"
+    );
+    assert!(
+        stdout.contains("init"),
+        "help should list the init command: {stdout}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+/// ADR-0005 root dispatch: `uncompose <sub> <args>` execs `uncompose-<sub> <args>`
+/// found on PATH. We stand up a minimal dispatcher matching that contract and
+/// confirm the binary answers through it with identical output and preserved
+/// exit codes. v0.1 targets Linux, so a POSIX-shell shim is sufficient.
+#[cfg(unix)]
+#[test]
+fn root_dispatch_delegates_preserving_args_and_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = Path::new(BIN).parent().unwrap();
+    let shim_dir = TempDir::new().unwrap();
+    let shim = shim_dir.path().join("uncompose");
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+sub="$1"; shift
+exec "uncompose-$sub" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}:{}",
+        shim_dir.path().display(),
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let dispatch = |dir: &Path, args: &[&str]| -> Output {
+        Command::new(&shim)
+            .args(args)
+            .env("PATH", &path)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run the dispatch shim")
+    };
+
+    let project = TempDir::new().unwrap();
+
+    // `--version` through dispatch is byte-identical to a direct invocation.
+    let delegated = dispatch(project.path(), &["project", "--version"]);
+    assert!(delegated.status.success());
+    assert_eq!(delegated.stdout, run(project.path(), &["--version"]).stdout);
+
+    // A delegated command succeeds and takes effect (manifest written).
+    let init = dispatch(project.path(), &["project", "init"]);
+    assert!(
+        init.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(project.path().join(MANIFEST_FILENAME).exists());
+
+    // A refusal's non-zero exit code is preserved through dispatch.
+    let reinit = dispatch(project.path(), &["project", "init"]);
+    assert!(
+        !reinit.status.success(),
+        "re-init should refuse and exit non-zero through dispatch"
+    );
+}
+
+#[test]
 fn init_creates_a_canonical_manifest_named_after_the_dir() {
     let parent = TempDir::new().unwrap();
     let root = parent.path().join("my-project");

@@ -13,3 +13,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0001 — Adopt manifest schema v0](0001-adopt-manifest-schema-v0.md)
 - [0002 — Canonical, atomic manifest writes](0002-canonical-atomic-manifest-writes.md)
 - [0003 — `add`: hashing, slug ids, and path validation](0003-add-command-hashing-slugs-path-validation.md)
+- [0004 — maturin wheel packaging and root dispatch conformance](0004-maturin-wheel-packaging-and-dispatch-conformance.md)
