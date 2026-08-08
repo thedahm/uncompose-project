@@ -110,14 +110,13 @@ fn import_refuses_an_out_of_tree_input_with_the_add_instruction() {
         .unwrap()
         .join("uncompose-outside-input.wav");
     fs::write(&outside, b"hello").unwrap();
-    let outside_sha = HELLO_SHA256;
 
     let job_dir = dir.path().join("run1");
     fs::create_dir_all(&job_dir).unwrap();
     fs::write(job_dir.join("vocals.wav"), b"vocals").unwrap();
     let job = serde_json::json!({
         "input_path": "../uncompose-outside-input.wav",
-        "input_sha256": outside_sha,
+        "input_sha256": HELLO_SHA256,
         "preset": "studio",
         "stems": ["vocals"],
         "engine_version": "1",
