@@ -99,3 +99,67 @@ fn import_refuses_a_missing_job_record() {
     let err = import(dir.path(), Path::new("nope/job.json")).unwrap_err();
     assert!(matches!(err, ImportError::JobMissing(_)), "got {err:?}");
 }
+
+#[test]
+fn import_refuses_an_out_of_tree_input_with_the_add_instruction() {
+    let dir = project();
+    // A real input file outside the root; the job points at it via `../`.
+    let outside = dir
+        .path()
+        .parent()
+        .unwrap()
+        .join("uncompose-outside-input.wav");
+    fs::write(&outside, b"hello").unwrap();
+    let outside_sha = HELLO_SHA256;
+
+    let job_dir = dir.path().join("run1");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(job_dir.join("vocals.wav"), b"vocals").unwrap();
+    let job = serde_json::json!({
+        "input_path": "../uncompose-outside-input.wav",
+        "input_sha256": outside_sha,
+        "preset": "studio",
+        "stems": ["vocals"],
+        "engine_version": "1",
+        "outcome": "success",
+        "finished_at_unix": 1,
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
+
+    let err = import(dir.path(), Path::new("run1/job.json")).unwrap_err();
+    let _ = fs::remove_file(&outside);
+    match err {
+        ImportError::InputOutsideRoot(_) => {
+            // The message tells the user to register it first.
+            assert!(
+                err.to_string().contains("add"),
+                "message should point at `add`: {err}"
+            );
+        }
+        other => panic!("expected InputOutsideRoot, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_tolerates_unknown_extra_fields_in_the_job_record() {
+    let dir = project();
+    let job_dir = dir.path().join("run1");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(job_dir.join("vocals.wav"), b"vocals").unwrap();
+    let job = serde_json::json!({
+        "input_path": "mix.wav",
+        "input_sha256": HELLO_SHA256,
+        "preset": "studio",
+        "stems": ["vocals"],
+        "engine_version": "1",
+        "outcome": "success",
+        "finished_at_unix": 1,
+        "models": { "note": "an unknown extra the importer must tolerate" },
+        "device": "cpu",
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+
+    let report = import(dir.path(), Path::new("run1/job.json")).unwrap();
+    assert_eq!(report.stems.len(), 1);
+}

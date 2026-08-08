@@ -559,31 +559,70 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
 
     let created_at = unix_to_rfc3339(job.finished_at_unix)?;
 
-    // Resolve the input, auto-register it as `mix`, and confirm its current bytes
-    // still match what the separation hashed.
-    let input_candidate = PathBuf::from(&job.input_path);
-    let (input_abs, input_rel) = canonical_inside(root, &canonical_root, &input_candidate)
-        .map_err(|k| match k {
-            ResolveKind::Missing => ImportError::InputMissing(input_candidate.clone()),
-            ResolveKind::Unreadable(e) => ImportError::InputUnreadable(input_candidate.clone(), e),
-            ResolveKind::Outside => ImportError::InputOutsideRoot(input_candidate.clone()),
-        })?;
-    let (input_hash, input_size) = sha256_file(&input_abs)
-        .map_err(|e| ImportError::InputUnreadable(input_candidate.clone(), e))?;
-    if input_hash != job.input_sha256 {
-        return Err(ImportError::InputHashMismatch {
-            path: input_rel,
-            expected: job.input_sha256,
-            actual: input_hash,
-        });
-    }
+    let now = now_rfc3339();
+    // Ids are minted against the manifest's existing asset ids plus the ones this
+    // import is about to add, so a run with same-named stems does not collide.
+    let mut taken: HashSet<String> = manifest.assets.iter().map(|a| a.id.clone()).collect();
+    let mut new_assets: Vec<Asset> = Vec::new();
 
-    // Resolve and hash each stem; they live as `<name>.wav` in the job folder.
+    // Input resolution (uncompose#63): a registered asset whose sha256 already
+    // matches the job's `input_sha256` wins regardless of the job's `input_path`,
+    // so a mix already registered under any name links here without a duplicate.
+    // Only when no asset matches does import resolve the job's input path and
+    // auto-register it as `mix`, after confirming its current bytes still hash to
+    // the record. Import never copies files, so an out-of-tree input refuses.
+    let (input_id, input_report) = if let Some(existing) = manifest
+        .assets
+        .iter()
+        .find(|a| a.sha256 == job.input_sha256)
+    {
+        (existing.id.clone(), existing.clone())
+    } else {
+        let input_candidate = PathBuf::from(&job.input_path);
+        let (input_abs, input_rel) = canonical_inside(root, &canonical_root, &input_candidate)
+            .map_err(|k| match k {
+                ResolveKind::Missing => ImportError::InputMissing(input_candidate.clone()),
+                ResolveKind::Unreadable(e) => {
+                    ImportError::InputUnreadable(input_candidate.clone(), e)
+                }
+                ResolveKind::Outside => ImportError::InputOutsideRoot(input_candidate.clone()),
+            })?;
+        let (input_hash, input_size) = sha256_file(&input_abs)
+            .map_err(|e| ImportError::InputUnreadable(input_candidate.clone(), e))?;
+        if input_hash != job.input_sha256 {
+            return Err(ImportError::InputHashMismatch {
+                path: input_rel,
+                expected: job.input_sha256,
+                actual: input_hash,
+            });
+        }
+        let input_stem = Path::new(&input_rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let input_id = mint_id_with(&slugify(input_stem), |c| taken.contains(c));
+        taken.insert(input_id.clone());
+        let input_asset = Asset {
+            id: input_id.clone(),
+            path: input_rel,
+            sha256: input_hash,
+            size: input_size,
+            role: INPUT_ROLE.to_string(),
+            added_at: now.clone(),
+            last_verified: None,
+            ext: None,
+        };
+        new_assets.push(input_asset.clone());
+        (input_id, input_asset)
+    };
+
+    // Resolve, hash, and register each stem; they live as `<name>.wav` in the job
+    // folder, which must itself sit inside the project root.
     let job_folder = job_abs
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.to_path_buf());
-    let mut stems = Vec::with_capacity(job.stems.len());
+    let mut stem_assets = Vec::with_capacity(job.stems.len());
     for name in &job.stems {
         let candidate = job_folder.join(format!("{name}.wav"));
         let (stem_abs, stem_rel) =
@@ -594,45 +633,20 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
             })?;
         let (stem_hash, stem_size) = sha256_file(&stem_abs)
             .map_err(|e| ImportError::StemUnreadable(candidate.clone(), e))?;
-        stems.push((name.clone(), stem_rel, stem_hash, stem_size));
-    }
-
-    // Mint ids against the manifest's existing asset ids plus the ones this
-    // import is about to add, so a run with same-named stems does not collide.
-    let now = now_rfc3339();
-    let mut taken: HashSet<String> = manifest.assets.iter().map(|a| a.id.clone()).collect();
-
-    let input_stem = Path::new(&input_rel)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let input_id = mint_id_with(&slugify(input_stem), |c| taken.contains(c));
-    taken.insert(input_id.clone());
-    let input_asset = Asset {
-        id: input_id.clone(),
-        path: input_rel,
-        sha256: input_hash,
-        size: input_size,
-        role: INPUT_ROLE.to_string(),
-        added_at: now.clone(),
-        last_verified: None,
-        ext: None,
-    };
-
-    let mut stem_assets = Vec::with_capacity(stems.len());
-    for (name, path, sha256, size) in stems {
-        let id = mint_id_with(&slugify(&name), |c| taken.contains(c));
+        let id = mint_id_with(&slugify(name), |c| taken.contains(c));
         taken.insert(id.clone());
-        stem_assets.push(Asset {
+        let stem_asset = Asset {
             id,
-            path,
-            sha256,
-            size,
+            path: stem_rel,
+            sha256: stem_hash,
+            size: stem_size,
             role: STEM_ROLE.to_string(),
             added_at: now.clone(),
             last_verified: None,
             ext: None,
-        });
+        };
+        new_assets.push(stem_asset.clone());
+        stem_assets.push(stem_asset);
     }
 
     // The derivation ties the input to the stems; `params` carries only the
@@ -663,15 +677,14 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
         ext: None,
     };
 
-    manifest.assets.push(input_asset.clone());
-    manifest.assets.extend(stem_assets.iter().cloned());
+    manifest.assets.extend(new_assets);
     manifest.derivations.push(derivation);
 
     let bytes = manifest.to_canonical_json();
     write_atomic(&manifest_path, bytes.as_bytes()).map_err(ImportError::Io)?;
 
     Ok(ImportReport {
-        input: input_asset,
+        input: input_report,
         stems: stem_assets,
         derivation_id,
     })
