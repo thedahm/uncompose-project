@@ -1,5 +1,6 @@
 /target
 /dist
+.env
 engine/.venv/
 __pycache__/
 node_modules/
