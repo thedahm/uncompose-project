@@ -268,7 +268,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // The {{BRANCHES}} and {{ISSUES}} prompt arguments are lists that the agent
   // uses to know which branches to merge and which issues to close.
   // -------------------------------------------------------------------------
-  await sandcastle.run({
+  const merge = await sandcastle.run({
     hooks,
     sandbox: docker(),
     name: "merger",
@@ -283,6 +283,16 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
     },
   });
+
+  if (!merge.completionSignal) {
+    // The merger hit a blocker (auth, unresolvable conflict, …) and did not
+    // finish. Replanning would just re-run the same doomed merge, so stop
+    // and let a human look at the merger log.
+    console.error(
+      "\nMerger did not signal completion — see .sandcastle/logs/ for the blocker. Stopping.",
+    );
+    break;
+  }
 
   console.log("\nBranches merged.");
 
@@ -334,7 +344,7 @@ if (remaining.length > 0) {
   console.log(`Spec PR #${prNumber} opened.`);
 
   // Final review: skill-first (/code-review), posted as a PR comment.
-  await sandcastle.run({
+  const review = await sandcastle.run({
     hooks,
     sandbox: docker(),
     name: "final-reviewer",
@@ -347,10 +357,15 @@ if (remaining.length > 0) {
       SPEC_BRANCH: specBranch,
     },
   });
+  if (!review.completionSignal) {
+    throw new Error(
+      "Final reviewer did not signal completion — the review comment may be missing. Not running the address step; check .sandcastle/logs/.",
+    );
+  }
   console.log("Final review posted.");
 
   // Address the review in a single round; the PR then waits for a human.
-  await sandcastle.run({
+  const addressed = await sandcastle.run({
     hooks,
     sandbox: docker(),
     name: "address-final-review",
@@ -359,9 +374,15 @@ if (remaining.length > 0) {
     promptFile: "./.sandcastle/address-final-review-prompt.md",
     promptArgs: { PR_NUMBER: prNumber, SPEC_BRANCH: specBranch },
   });
-  console.log(
-    `Review addressed. PR #${prNumber} is ready for human review and merge.`,
-  );
+  if (!addressed.completionSignal) {
+    console.error(
+      `address-final-review did not signal completion — PR #${prNumber} may have unaddressed feedback. Check .sandcastle/logs/.`,
+    );
+  } else {
+    console.log(
+      `Review addressed. PR #${prNumber} is ready for human review and merge.`,
+    );
+  }
 }
 
 console.log("\nAll done.");
