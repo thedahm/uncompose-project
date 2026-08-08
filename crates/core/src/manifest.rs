@@ -913,7 +913,9 @@ fn render_overview(m: &Manifest) -> String {
 }
 
 /// Render one derivation: id and tool header, then inputs, outputs, and when it
-/// was created.
+/// was created. An imported derivation also shows its preset and the hashed
+/// `job` reference (path + sha256); a hand-written derivation carrying neither
+/// simply omits those lines.
 fn render_derivation(o: &mut String, d: &Derivation) {
     use std::fmt::Write;
     let tool_label = match &d.tool_version {
@@ -924,6 +926,22 @@ fn render_derivation(o: &mut String, d: &Derivation) {
     let _ = writeln!(o, "    inputs:  {}", d.inputs.join(", "));
     let _ = writeln!(o, "    outputs: {}", d.outputs.join(", "));
     let _ = writeln!(o, "    created: {}", d.created_at);
+    if let Some(preset) = d.params.as_ref().and_then(|p| p.get("preset")) {
+        let _ = writeln!(o, "    preset:  {}", render_scalar(preset));
+    }
+    if let Some(job) = &d.job {
+        let _ = writeln!(o, "    job:     {} (sha256 {})", job.path, job.sha256);
+    }
+}
+
+/// Render a JSON scalar for the human overview: a string as its bare contents,
+/// anything else as its compact JSON. Keeps `preset: studio` from printing as
+/// `"studio"` while still showing a non-string preset legibly.
+fn render_scalar(v: &Value) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    }
 }
 
 /// Read and strictly parse the manifest at `root`, returning both the exact file
