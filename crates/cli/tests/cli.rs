@@ -991,6 +991,80 @@ fn import_works_through_root_dispatch() {
     assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
 }
 
+// --- M2 slice 2: input resolution by hash, out-of-tree and bad-record refusals ---
+
+/// Acceptance: a job input whose `input_sha256` matches an already-registered
+/// asset reuses that asset (hash wins regardless of the job's `input_path`) — no
+/// duplicate registration, and the derivation links to the existing id.
+#[test]
+fn import_reuses_a_registered_asset_matching_the_input_hash() {
+    let dir = init_project();
+    // Register `original.wav` (b"hello") up front; its id mints from the stem.
+    fs::write(dir.path().join("original.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "original.wav"]).status.success());
+
+    // A job whose input lives at a different path (`mix.wav`) but carries the
+    // same bytes, so its `input_sha256` matches the registered asset.
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    let output = run(dir.path(), &["import", &job]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    // Only the pre-registered input and the one stem — `mix.wav` is not added.
+    let paths: Vec<&str> = assets.iter().map(|a| a["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        vec!["original.wav", "run1/vocals.wav"],
+        "no dup input"
+    );
+
+    // The derivation links to the existing asset's id, not a fresh one.
+    let d = &manifest["derivations"].as_array().unwrap()[0];
+    assert_eq!(d["inputs"], serde_json::json!(["original"]));
+    assert_valid_against_schema(&manifest);
+}
+
+/// Acceptance: a job folder outside the project root refuses; the manifest is
+/// left byte-identical.
+#[test]
+fn import_refuses_a_job_folder_outside_the_project_root() {
+    let dir = init_project();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    // A job folder in the parent of the project root, reached via `../`.
+    let outside = dir.path().parent().unwrap().join("uncompose-outside-run");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("job.json"), b"{}").unwrap();
+
+    let output = run(dir.path(), &["import", "../uncompose-outside-run/job.json"]);
+    let _ = fs::remove_dir_all(&outside);
+    assert!(!output.status.success(), "an out-of-root job should refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("outside the project root"),
+        "error should name the confinement: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused import leaves the manifest untouched"
+    );
+}
+
 // --- M1.5: verify with integrity statuses and the milestone DoD ---
 
 #[test]
