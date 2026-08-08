@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
+use uncompose_project_core::{add, import, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version, about = tagline(), arg_required_else_help = true)]
@@ -36,6 +36,12 @@ enum Command {
         #[arg(long, default_value = DEFAULT_ROLE)]
         role: String,
     },
+    /// Import a completed uncompose job: register its input, stems, and the
+    /// derivation that ties them together.
+    Import {
+        /// Path to the job's `job.json`, relative to the project root.
+        job: PathBuf,
+    },
     /// Check that each registered file still matches its recorded identity.
     Verify,
     /// Print a readable overview of the project, its assets, and derivations.
@@ -50,6 +56,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Init { name } => run_init(name),
         Command::Add { path, id, role } => run_add(path, id, role),
+        Command::Import { job } => run_import(job),
         Command::Verify => run_verify(),
         Command::Show { json } => run_show(json),
     }
@@ -155,6 +162,32 @@ fn run_show(json: bool) -> ExitCode {
             } else {
                 print!("{}", out.overview);
             }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_import(job: PathBuf) -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
+    };
+    match import(&root, &job) {
+        Ok(report) => {
+            println!(
+                "Imported '{}' ({} stem{})",
+                report.derivation_id,
+                report.stems.len(),
+                if report.stems.len() == 1 { "" } else { "s" }
+            );
+            println!("  input:      {} ({})", report.input.id, report.input.path);
+            for stem in &report.stems {
+                println!("  stem:       {} ({})", stem.id, stem.path);
+            }
+            println!("  derivation: {}", report.derivation_id);
             ExitCode::SUCCESS
         }
         Err(e) => {

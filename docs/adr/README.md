@@ -17,3 +17,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0005 — Strict manifest reads and `ext` pass-through](0005-strict-manifest-reads-and-ext-passthrough.md)
 - [0006 — `verify`: derived integrity statuses and the `last_verified` cache](0006-verify-integrity-statuses-and-last-verified.md)
 - [0007 — `show`: human overview and `--json`](0007-show-command-human-overview-and-json.md)
+- [0008 — `import`: job.json to input, stems, and a derivation](0008-import-command-job-to-derivation.md)
