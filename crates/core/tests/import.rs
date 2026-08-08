@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use tempfile::TempDir;
-use uncompose_project_core::{import, init, ImportError};
+use uncompose_project_core::{add, import, init, ImportError, ImportOutcome};
 
 /// sha256 of `b"hello"`.
 const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -159,6 +159,53 @@ fn import_tolerates_unknown_extra_fields_in_the_job_record() {
     fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
     fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
 
-    let report = import(dir.path(), Path::new("run1/job.json")).unwrap();
+    let report = match import(dir.path(), Path::new("run1/job.json")).unwrap() {
+        ImportOutcome::Imported(r) => r,
+        other => panic!("expected an import, got {other:?}"),
+    };
     assert_eq!(report.stems.len(), 1);
+}
+
+#[test]
+fn re_importing_the_same_job_is_a_stated_noop() {
+    let dir = project();
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+
+    let first = match import(dir.path(), &job).unwrap() {
+        ImportOutcome::Imported(r) => r,
+        other => panic!("expected an import, got {other:?}"),
+    };
+
+    match import(dir.path(), &job).unwrap() {
+        ImportOutcome::AlreadyImported { derivation_id } => {
+            assert_eq!(derivation_id, first.derivation_id);
+        }
+        other => panic!("expected AlreadyImported, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_refuses_a_stem_path_registered_with_a_conflicting_hash() {
+    let dir = project();
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+
+    // Register the stem path, then tamper with the file so the recorded hash and
+    // the bytes on disk disagree at import time.
+    add(dir.path(), Path::new("run1/vocals.wav"), None, "stem").unwrap();
+    fs::write(dir.path().join("run1/vocals.wav"), b"tampered").unwrap();
+
+    let err = import(dir.path(), &job).unwrap_err();
+    match err {
+        ImportError::StemPathConflict {
+            path,
+            registered,
+            actual,
+        } => {
+            assert_eq!(path, "run1/vocals.wav");
+            assert_ne!(registered, actual);
+        }
+        other => panic!("expected StemPathConflict, got {other:?}"),
+    }
 }
