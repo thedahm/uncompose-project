@@ -4,19 +4,21 @@ Merge the following branches into `{{SPEC_BRANCH}}`, each via a pull request so 
 
 {{BRANCHES}}
 
+The PR is the merge vehicle, not just paperwork: `{{SPEC_BRANCH}}` only advances through `gh pr merge --merge`, so every landed branch shows up as a real merge commit on GitHub. Never `git merge` a branch into `{{SPEC_BRANCH}}` yourself and never push `{{SPEC_BRANCH}}` directly to land a branch — the one exception is the final fix-up step at the end.
+
 For each branch, one at a time:
 
 1. Push it: `git push -u origin <branch>`
 2. Open a PR: `gh pr create --base {{SPEC_BRANCH}} --head <branch> --title "<issue title>" --body "<one-paragraph summary of what the branch does, referencing its issue like #42>"`
-3. Merge it with a merge commit: `gh pr merge <branch> --merge`
-4. If GitHub reports the PR is not mergeable because of conflicts, resolve them locally first:
+3. If you need to validate or the PR is not mergeable because of conflicts, work on the branch side only:
    - `git checkout <branch>` then `git merge {{SPEC_BRANCH}} --no-edit`
-   - Resolve conflicts intelligently by reading both sides and choosing the correct resolution
+   - Resolve any conflicts intelligently by reading both sides and choosing the correct resolution
    - Run the repo checks (below); fix failures before continuing
-   - `git push`, switch back to `{{SPEC_BRANCH}}`, and merge the PR as in step 3
+   - `git push` (the branch — not `{{SPEC_BRANCH}}`)
+4. Merge the PR with a merge commit: `gh pr merge <branch> --merge`
 5. After the PR merges, `git checkout {{SPEC_BRANCH}} && git pull` so the next branch merges against the latest state
 
-After all branches are merged, run the repo checks on `{{SPEC_BRANCH}}` one final time. If something fails, fix it, commit, and push.
+After all branches are merged, run the repo checks on `{{SPEC_BRANCH}}` one final time. If something fails, fix it, commit, and push — this post-merge fix-up is the only direct push to `{{SPEC_BRANCH}}` allowed.
 
 # REPO CHECKS
 

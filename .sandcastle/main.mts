@@ -161,6 +161,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   );
   for (const issue of issues) {
     console.log(`  ${issue.id}: ${issue.title} → ${issue.branch}`);
+    // Claim the issue (same convention wayfinder uses): assign it to the
+    // authenticated account so in-flight work is visible on the board.
+    sh(`gh issue edit ${issue.id} --add-assignee "@me"`);
   }
 
   // -------------------------------------------------------------------------
