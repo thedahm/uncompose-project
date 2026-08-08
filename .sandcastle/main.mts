@@ -232,29 +232,41 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     }
   }
 
-  // Only pass branches that actually produced commits to the merge phase.
-  // An agent that ran successfully but made no commits has nothing to merge.
+  // Only pass branches with unmerged work to the merge phase. Gate on the
+  // branch being ahead of the spec branch, not on commits made during this
+  // run: a reused branch can carry commits from an earlier run (e.g. a run
+  // whose merge phase failed), and those still need merging even when the
+  // implementer verified the work and finished without committing anything
+  // new.
+  const branchAhead = (branch: string): number => {
+    try {
+      return Number(sh(`git rev-list --count "${specBranch}".."${branch}"`));
+    } catch {
+      return 0; // branch doesn't exist on the host — nothing to merge
+    }
+  };
+
   const completedIssues = settled
     .map((outcome, i) => ({ outcome, issue: issues[i]! }))
     .filter(
       (entry) =>
         entry.outcome.status === "fulfilled" &&
-        entry.outcome.value.commits.length > 0,
+        branchAhead(entry.issue.branch) > 0,
     )
     .map((entry) => entry.issue);
 
   const completedBranches = completedIssues.map((i) => i.branch);
 
   console.log(
-    `\nExecution complete. ${completedBranches.length} branch(es) with commits:`,
+    `\nExecution complete. ${completedBranches.length} branch(es) with unmerged commits:`,
   );
   for (const branch of completedBranches) {
     console.log(`  ${branch}`);
   }
 
   if (completedBranches.length === 0) {
-    // All agents ran but none made commits — nothing to merge this cycle.
-    console.log("No commits produced. Nothing to merge.");
+    // No branch is ahead of the spec branch — nothing to merge this cycle.
+    console.log("No unmerged commits on any branch. Nothing to merge.");
     continue;
   }
 
