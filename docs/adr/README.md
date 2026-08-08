@@ -19,3 +19,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0007 — `show`: human overview and `--json`](0007-show-command-human-overview-and-json.md)
 - [0008 — `import`: job.json to input, stems, and a derivation](0008-import-command-job-to-derivation.md)
 - [0009 — `import`: input resolution by hash, out-of-tree and bad-record refusals](0009-import-hash-resolution-and-out-of-tree-refusals.md)
+- [0010 — `import`: idempotent re-import and per-path asset dedupe](0010-import-idempotency-and-per-path-dedupe.md)

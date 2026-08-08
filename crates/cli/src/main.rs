@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, import, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
+use uncompose_project_core::{
+    add, import, init, show, tagline, verify, ImportOutcome, Integrity, DEFAULT_ROLE,
+};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version, about = tagline(), arg_required_else_help = true)]
@@ -176,7 +178,7 @@ fn run_import(job: PathBuf) -> ExitCode {
         return ExitCode::FAILURE;
     };
     match import(&root, &job) {
-        Ok(report) => {
+        Ok(ImportOutcome::Imported(report)) => {
             println!(
                 "Imported '{}' ({} stem{})",
                 report.derivation_id,
@@ -188,6 +190,10 @@ fn run_import(job: PathBuf) -> ExitCode {
                 println!("  stem:       {} ({})", stem.id, stem.path);
             }
             println!("  derivation: {}", report.derivation_id);
+            ExitCode::SUCCESS
+        }
+        Ok(ImportOutcome::AlreadyImported { derivation_id }) => {
+            println!("Already imported as '{derivation_id}'; job.json unchanged, nothing to do");
             ExitCode::SUCCESS
         }
         Err(e) => {

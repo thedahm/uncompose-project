@@ -1108,6 +1108,231 @@ fn import_refuses_a_job_folder_outside_the_project_root() {
     );
 }
 
+// --- M2 slice 3: idempotent re-import and per-path asset dedupe ---
+
+/// Acceptance: re-importing the same `job.json` (matching sha256) is a stated
+/// no-op — exit 0, a message that names the existing derivation, and the manifest
+/// left byte-identical.
+#[test]
+fn a_second_import_of_the_same_job_is_a_stated_noop() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    assert!(run(dir.path(), &["import", &job]).status.success());
+    let after_first = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &job]);
+    assert!(
+        output.status.success(),
+        "a re-import must exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("run1") && stdout.to_lowercase().contains("already"),
+        "the no-op should name the existing derivation: {stdout}"
+    );
+
+    let after_second = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(
+        after_first, after_second,
+        "a no-op import leaves the manifest byte-identical"
+    );
+}
+
+/// Acceptance: the same job path with different content (a distinct sha256) is a
+/// genuinely different run and imports as a second derivation.
+#[test]
+fn same_job_path_with_different_content_imports_a_new_derivation() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    assert!(run(dir.path(), &["import", &job]).status.success());
+
+    // Rewrite the job.json in place with a different preset — same path, new bytes.
+    let changed = serde_json::json!({
+        "input_path": "mix.wav",
+        "input_sha256": HELLO_SHA256,
+        "preset": "live",
+        "stems": ["vocals"],
+        "engine_version": "1.2.3",
+        "outcome": "success",
+        "finished_at_unix": FINISHED_AT_UNIX,
+    });
+    fs::write(dir.path().join(&job), changed.to_string()).unwrap();
+
+    let output = run(dir.path(), &["import", &job]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    let derivations = manifest["derivations"].as_array().unwrap();
+    assert_eq!(
+        derivations.len(),
+        2,
+        "a differently-hashed job at the same path is a new derivation"
+    );
+    let presets: Vec<&Value> = derivations.iter().map(|d| &d["params"]["preset"]).collect();
+    assert!(
+        presets.contains(&&Value::from("studio")) && presets.contains(&&Value::from("live")),
+        "both runs recorded: {presets:?}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Acceptance: a stem path already registered (here via `add`) with a matching
+/// hash is reused, not duplicated; the derivation links the existing id.
+#[test]
+fn import_reuses_a_same_path_same_hash_stem_asset() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    // Register the stem file up front, so import overlaps an existing asset.
+    assert!(run(dir.path(), &["add", "run1/vocals.wav"])
+        .status
+        .success());
+    let before_assets = read_manifest(dir.path())["assets"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    let output = run(dir.path(), &["import", &job]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    let vocals: Vec<&Value> = assets
+        .iter()
+        .filter(|a| a["path"] == "run1/vocals.wav")
+        .collect();
+    assert_eq!(
+        vocals.len(),
+        1,
+        "the stem path is not duplicated: {assets:?}"
+    );
+    // Import added only the input `mix`, not a second stem row.
+    assert_eq!(assets.len(), before_assets + 1);
+
+    let d = &manifest["derivations"].as_array().unwrap()[0];
+    let reused_id = vocals[0]["id"].as_str().unwrap();
+    assert_eq!(
+        d["outputs"],
+        serde_json::json!([reused_id]),
+        "the derivation links the reused asset id"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Acceptance: a registered stem path whose bytes no longer match refuses the
+/// import naming the conflict, and leaves the manifest byte-identical.
+#[test]
+fn import_refuses_a_stem_path_whose_registered_hash_conflicts() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    // Register the stem, then change the file on disk so the recorded hash and the
+    // bytes the import would hash now disagree.
+    assert!(run(dir.path(), &["add", "run1/vocals.wav"])
+        .status
+        .success());
+    fs::write(dir.path().join("run1/vocals.wav"), b"tampered").unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &job]);
+    assert!(!output.status.success(), "a path/hash conflict must refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("run1/vocals.wav"),
+        "the error should name the conflicting path: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused import leaves the manifest untouched"
+    );
+}
+
+/// Acceptance: identical bytes at two different paths stay two distinct assets —
+/// per-path dedupe never collapses by hash alone.
+#[test]
+fn identical_bytes_at_two_paths_remain_two_assets() {
+    let dir = init_project();
+    // Both stems carry identical bytes but live at distinct paths.
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    let job_dir = dir.path().join("run1");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(job_dir.join("left.wav"), b"same-bytes").unwrap();
+    fs::write(job_dir.join("right.wav"), b"same-bytes").unwrap();
+    let job = serde_json::json!({
+        "input_path": "mix.wav",
+        "input_sha256": HELLO_SHA256,
+        "preset": "studio",
+        "stems": ["left", "right"],
+        "engine_version": "1.2.3",
+        "outcome": "success",
+        "finished_at_unix": FINISHED_AT_UNIX,
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
+
+    let output = run(dir.path(), &["import", "run1/job.json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    let stem_paths: Vec<&str> = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["role"] == "stem")
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        stem_paths,
+        vec!["run1/left.wav", "run1/right.wav"],
+        "identical bytes at two paths are two assets"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
 // --- M1.5: verify with integrity statuses and the milestone DoD ---
 
 #[test]

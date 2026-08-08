@@ -426,6 +426,18 @@ pub struct ImportReport {
     pub derivation_id: String,
 }
 
+/// The result of an `import`: either a fresh import that wrote the manifest, or a
+/// stated no-op because a derivation already records this exact `job.json`
+/// (matched on its sha256). The idempotency key lets scripts re-run import safely.
+#[derive(Debug)]
+pub enum ImportOutcome {
+    /// The job was imported; the manifest was written.
+    Imported(Box<ImportReport>),
+    /// A derivation already records this `job.json` (same sha256); nothing was
+    /// written. The existing derivation's id is named.
+    AlreadyImported { derivation_id: String },
+}
+
 /// Why an `import` could not run. Every variant is raised before any write, so a
 /// refused import leaves the manifest byte-identical and is free to retry.
 #[derive(Debug)]
@@ -463,6 +475,20 @@ pub enum ImportError {
     StemUnreadable(PathBuf, io::Error),
     /// A stem resolves outside the project root.
     StemOutsideRoot(PathBuf),
+    /// The input's path is already registered with a hash that conflicts with the
+    /// file the import would record; both hashes are named.
+    InputPathConflict {
+        path: String,
+        registered: String,
+        actual: String,
+    },
+    /// A stem's path is already registered with a hash that conflicts with the
+    /// file the import would record; both hashes are named.
+    StemPathConflict {
+        path: String,
+        registered: String,
+        actual: String,
+    },
     /// Writing the manifest failed.
     Io(io::Error),
 }
@@ -511,6 +537,22 @@ impl std::fmt::Display for ImportError {
                 "stem {} resolves outside the project root",
                 p.display()
             ),
+            ImportError::InputPathConflict {
+                path,
+                registered,
+                actual,
+            } => write!(
+                f,
+                "input {path} is registered with sha256 {registered} but the file now hashes to {actual}; resolve the conflict before importing"
+            ),
+            ImportError::StemPathConflict {
+                path,
+                registered,
+                actual,
+            } => write!(
+                f,
+                "stem {path} is registered with sha256 {registered} but the file now hashes to {actual}; resolve the conflict before importing"
+            ),
             ImportError::Io(e) => write!(f, "failed to write manifest: {e}"),
         }
     }
@@ -529,11 +571,14 @@ impl From<LoadError> for ImportError {
 /// recording the separation with a hashed reference to the `job.json`. The
 /// `job.json` itself is referenced, never registered as an asset.
 ///
-/// Refuses — leaving the manifest byte-identical — when the job record is
-/// missing/unreadable/malformed, its `outcome` is not success, the input's
-/// current bytes do not match the recorded `input_sha256`, or any referenced file
-/// resolves outside the project root. Writes the updated manifest once, atomically.
-pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> {
+/// A `job.json` whose sha256 a derivation already records is a stated no-op:
+/// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
+/// is written. Otherwise refuses — leaving the manifest byte-identical — when the
+/// job record is missing/unreadable/malformed, its `outcome` is not success, the
+/// input's current bytes do not match the recorded `input_sha256`, any referenced
+/// file resolves outside the project root, or a referenced path is already
+/// registered with a conflicting hash. Writes the updated manifest once, atomically.
+pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let (_, mut manifest) = load_manifest(root)?;
 
@@ -549,6 +594,21 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
     let job_bytes = std::fs::read(&job_abs)
         .map_err(|e| ImportError::JobUnreadable(job_arg.to_path_buf(), e))?;
     let job_sha256 = sha256_hex(&job_bytes);
+
+    // Idempotency (uncompose#63): any existing derivation whose `job.sha256` equals
+    // this record's is the same import already done — a stated no-op, exit 0, no
+    // manifest write. A different sha256 at the same path is a genuinely different
+    // run and falls through to import as a new derivation below.
+    if let Some(existing) = manifest
+        .derivations
+        .iter()
+        .find(|d| d.job.as_ref().is_some_and(|j| j.sha256 == job_sha256))
+    {
+        return Ok(ImportOutcome::AlreadyImported {
+            derivation_id: existing.id.clone(),
+        });
+    }
+
     let job: JobRecord = serde_json::from_slice(&job_bytes)
         .map_err(|e| ImportError::MalformedJob(job_arg.to_path_buf(), e))?;
 
@@ -596,6 +656,16 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
                 actual: input_hash,
             });
         }
+        // Per-path dedupe: no asset matched the input's hash above, so a registered
+        // asset at this path necessarily records a different hash — a conflict the
+        // import refuses rather than silently shadowing.
+        if let Some(existing) = manifest.assets.iter().find(|a| a.path == input_rel) {
+            return Err(ImportError::InputPathConflict {
+                path: input_rel,
+                registered: existing.sha256.clone(),
+                actual: input_hash,
+            });
+        }
         let input_stem = Path::new(&input_rel)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -633,6 +703,26 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
             })?;
         let (stem_hash, stem_size) = sha256_file(&stem_abs)
             .map_err(|e| ImportError::StemUnreadable(candidate.clone(), e))?;
+        // Per-path dedupe: a path already registered (in the manifest or minted
+        // earlier this run) with a matching hash is reused rather than duplicated;
+        // the same path with a conflicting hash refuses. Identical bytes at a
+        // different path stay a distinct asset, since we match on path, not hash.
+        if let Some(existing) = manifest
+            .assets
+            .iter()
+            .chain(new_assets.iter())
+            .find(|a| a.path == stem_rel)
+        {
+            if existing.sha256 != stem_hash {
+                return Err(ImportError::StemPathConflict {
+                    path: stem_rel,
+                    registered: existing.sha256.clone(),
+                    actual: stem_hash,
+                });
+            }
+            stem_assets.push(existing.clone());
+            continue;
+        }
         let id = mint_id_with(&slugify(name), |c| taken.contains(c));
         taken.insert(id.clone());
         let stem_asset = Asset {
@@ -683,11 +773,11 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
     let bytes = manifest.to_canonical_json();
     write_atomic(&manifest_path, bytes.as_bytes()).map_err(ImportError::Io)?;
 
-    Ok(ImportReport {
+    Ok(ImportOutcome::Imported(Box::new(ImportReport {
         input: input_asset,
         stems: stem_assets,
         derivation_id,
-    })
+    })))
 }
 
 /// Why [`canonical_inside`] could not resolve a path; each caller maps it into a
