@@ -30,10 +30,16 @@ fn synth_job(
     let job_dir = root.join("run1");
     fs::create_dir_all(&job_dir).unwrap();
     fs::write(job_dir.join("vocals.wav"), b"vocals").unwrap();
-    let job = format!(
-        "{{\"input_path\":\"mix.wav\",\"input_sha256\":\"{input_sha256}\",\"preset\":\"studio\",\"stems\":[\"vocals\"],\"engine_version\":\"1.2.3\",\"outcome\":\"{outcome}\",\"finished_at_unix\":1577923200}}\n"
-    );
-    fs::write(job_dir.join("job.json"), job).unwrap();
+    let job = serde_json::json!({
+        "input_path": "mix.wav",
+        "input_sha256": input_sha256,
+        "preset": "studio",
+        "stems": ["vocals"],
+        "engine_version": "1.2.3",
+        "outcome": outcome,
+        "finished_at_unix": 1_577_923_200u64,
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
     Path::new("run1").join("job.json")
 }
 
@@ -73,11 +79,15 @@ fn import_refuses_a_job_record_missing_a_required_field() {
     let job_dir = dir.path().join("run1");
     fs::create_dir_all(&job_dir).unwrap();
     // No `input_sha256` — a field the contract requires.
-    fs::write(
-        job_dir.join("job.json"),
-        "{\"input_path\":\"mix.wav\",\"preset\":\"studio\",\"stems\":[],\"engine_version\":\"1\",\"outcome\":\"success\",\"finished_at_unix\":1}\n",
-    )
-    .unwrap();
+    let job = serde_json::json!({
+        "input_path": "mix.wav",
+        "preset": "studio",
+        "stems": [],
+        "engine_version": "1",
+        "outcome": "success",
+        "finished_at_unix": 1,
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
 
     let err = import(dir.path(), Path::new("run1/job.json")).unwrap_err();
     assert!(matches!(err, ImportError::MalformedJob(..)), "got {err:?}");

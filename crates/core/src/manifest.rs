@@ -678,7 +678,7 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
 }
 
 /// Why [`canonical_inside`] could not resolve a path; each caller maps it into a
-/// context-specific [`ImportError`] (input vs stem vs job record).
+/// context-specific error (`add`'s path, or import's input vs stem vs job record).
 enum ResolveKind {
     /// No file exists at the resolved location.
     Missing,
@@ -691,7 +691,8 @@ enum ResolveKind {
 /// Resolve `candidate` (absolute, or relative to `root`) to its canonical path and
 /// its root-relative forward-slash form, confirming it lives inside the root.
 /// Canonicalizing both sides collapses `..` and follows symlinks, so an escape
-/// surfaces as a failed `strip_prefix` — the same confinement rule `add` applies.
+/// surfaces as a failed `strip_prefix` — the one confinement rule every command
+/// applies.
 fn canonical_inside(
     root: &Path,
     canonical_root: &Path,
@@ -724,18 +725,6 @@ fn unix_to_rfc3339(secs: u64) -> Result<String, ImportError> {
         .ok_or(ImportError::InvalidTimestamp(secs))?;
     dt.format(&Rfc3339)
         .map_err(|_| ImportError::InvalidTimestamp(secs))
-}
-
-/// SHA-256 hex digest of exact in-memory bytes — the manifest's sha256 form. Used
-/// for the `job.json` reference, whose bytes are already in memory from parsing.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The integrity of one asset, derived by re-checking disk against its recorded
@@ -996,10 +985,9 @@ fn check_ext(owner: &str, ext: Option<&Map<String, Value>>) -> Result<(), LoadEr
     Ok(())
 }
 
-/// Resolve `rel` against `root` and return its root-relative, forward-slash path,
-/// refusing absolute paths and anything that resolves outside the root (via `../`
-/// or a symlink). Canonicalizing both sides collapses `..` and follows symlinks,
-/// so an escape shows up as a failed `strip_prefix`.
+/// Resolve `rel` against `root` and return its root-relative, forward-slash path
+/// (via [`canonical_inside`]), refusing absolute paths and anything that resolves
+/// outside the root (via `../` or a symlink).
 fn resolve_inside_root(root: &Path, rel: &Path) -> Result<String, AddError> {
     if rel.is_absolute() {
         return Err(AddError::AbsolutePath(rel.to_path_buf()));
@@ -1007,18 +995,11 @@ fn resolve_inside_root(root: &Path, rel: &Path) -> Result<String, AddError> {
     let canonical_root = root
         .canonicalize()
         .map_err(|e| AddError::Unreadable(root.to_path_buf(), e))?;
-    let canonical = root.join(rel).canonicalize().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => AddError::MissingFile(rel.to_path_buf()),
-        _ => AddError::Unreadable(rel.to_path_buf(), e),
+    let (_, stored) = canonical_inside(root, &canonical_root, rel).map_err(|k| match k {
+        ResolveKind::Missing => AddError::MissingFile(rel.to_path_buf()),
+        ResolveKind::Unreadable(e) => AddError::Unreadable(rel.to_path_buf(), e),
+        ResolveKind::Outside => AddError::OutsideRoot(rel.to_path_buf()),
     })?;
-    let inside = canonical
-        .strip_prefix(&canonical_root)
-        .map_err(|_| AddError::OutsideRoot(rel.to_path_buf()))?;
-    let stored = inside
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
     Ok(stored)
 }
 
@@ -1029,12 +1010,24 @@ fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let size = io::copy(&mut file, &mut hasher)?;
-    let hex = hasher
+    Ok((hex_digest(hasher), size))
+}
+
+/// SHA-256 hex digest of exact in-memory bytes — the manifest's sha256 form. Used
+/// for the `job.json` reference, whose bytes are already in memory from parsing.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(hasher)
+}
+
+/// Finish a SHA-256 and render its digest as lowercase hex.
+fn hex_digest(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
-    Ok((hex, size))
+        .collect()
 }
 
 /// A character the schema slug pattern allows at the start: `[a-z0-9]`.

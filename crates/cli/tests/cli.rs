@@ -87,13 +87,13 @@ fn help_flag_prints_usage_and_commands() {
     assert!(output.stderr.is_empty());
 }
 
-/// ADR-0005 root dispatch: `uncompose <sub> <args>` execs `uncompose-<sub> <args>`
-/// found on PATH. We stand up a minimal dispatcher matching that contract and
-/// confirm the binary answers through it with identical output and preserved
-/// exit codes. v0.1 targets Linux, so a POSIX-shell shim is sufficient.
+/// Stand up the minimal ADR-0005 dispatcher: an `uncompose` shell shim that execs
+/// `uncompose-<sub> <args>` found on PATH. Returns the shim's temp dir (kept alive
+/// by the caller), the shim path, and a PATH value resolving both the shim and
+/// this crate's compiled binary. v0.1 targets Linux, so a POSIX-shell shim is
+/// sufficient.
 #[cfg(unix)]
-#[test]
-fn root_dispatch_delegates_preserving_args_and_exit_codes() {
+fn install_dispatch_shim() -> (TempDir, PathBuf, String) {
     use std::os::unix::fs::PermissionsExt;
 
     let bin_dir = Path::new(BIN).parent().unwrap();
@@ -108,13 +108,21 @@ exec "uncompose-$sub" "$@"
     )
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-
     let path = format!(
         "{}:{}:{}",
         shim_dir.path().display(),
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    (shim_dir, shim, path)
+}
+
+/// ADR-0005 root dispatch: the binary answers through the dispatcher with
+/// identical output and preserved exit codes.
+#[cfg(unix)]
+#[test]
+fn root_dispatch_delegates_preserving_args_and_exit_codes() {
+    let (_shim_dir, shim, path) = install_dispatch_shim();
     let dispatch = |dir: &Path, args: &[&str]| -> Output {
         Command::new(&shim)
             .args(args)
@@ -750,12 +758,17 @@ fn synth_job(
     for stem in stems {
         fs::write(job_dir.join(format!("{stem}.wav")), format!("{stem}-audio")).unwrap();
     }
-    let stems_json: Vec<String> = stems.iter().map(|s| format!("\"{s}\"")).collect();
-    let job = format!(
-        "{{\n  \"input_path\": \"{input_rel}\",\n  \"input_sha256\": \"{input_sha256}\",\n  \"preset\": \"studio\",\n  \"stems\": [{}],\n  \"engine_version\": \"1.2.3\",\n  \"outcome\": \"{outcome}\",\n  \"finished_at_unix\": {FINISHED_AT_UNIX},\n  \"models\": {{\"note\": \"tolerated unknown field\"}}\n}}\n",
-        stems_json.join(", ")
-    );
-    fs::write(job_dir.join("job.json"), job).unwrap();
+    let job = serde_json::json!({
+        "input_path": input_rel,
+        "input_sha256": input_sha256,
+        "preset": "studio",
+        "stems": stems,
+        "engine_version": "1.2.3",
+        "outcome": outcome,
+        "finished_at_unix": FINISHED_AT_UNIX,
+        "models": { "note": "tolerated unknown field" },
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
     format!("{folder}/job.json")
 }
 
@@ -941,26 +954,7 @@ fn import_refuses_an_input_hash_mismatch_naming_both_hashes() {
 #[cfg(unix)]
 #[test]
 fn import_works_through_root_dispatch() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let bin_dir = Path::new(BIN).parent().unwrap();
-    let shim_dir = TempDir::new().unwrap();
-    let shim = shim_dir.path().join("uncompose");
-    fs::write(
-        &shim,
-        r#"#!/bin/sh
-sub="$1"; shift
-exec "uncompose-$sub" "$@"
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}:{}",
-        shim_dir.path().display(),
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (_shim_dir, shim, path) = install_dispatch_shim();
 
     let dir = init_project();
     let job = synth_job(
