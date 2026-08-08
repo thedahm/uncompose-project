@@ -571,12 +571,12 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
     // Only when no asset matches does import resolve the job's input path and
     // auto-register it as `mix`, after confirming its current bytes still hash to
     // the record. Import never copies files, so an out-of-tree input refuses.
-    let (input_id, input_report) = if let Some(existing) = manifest
+    let input_asset = if let Some(existing) = manifest
         .assets
         .iter()
         .find(|a| a.sha256 == job.input_sha256)
     {
-        (existing.id.clone(), existing.clone())
+        existing.clone()
     } else {
         let input_candidate = PathBuf::from(&job.input_path);
         let (input_abs, input_rel) = canonical_inside(root, &canonical_root, &input_candidate)
@@ -602,8 +602,8 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
             .unwrap_or_default();
         let input_id = mint_id_with(&slugify(input_stem), |c| taken.contains(c));
         taken.insert(input_id.clone());
-        let input_asset = Asset {
-            id: input_id.clone(),
+        let asset = Asset {
+            id: input_id,
             path: input_rel,
             sha256: input_hash,
             size: input_size,
@@ -612,8 +612,8 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
             last_verified: None,
             ext: None,
         };
-        new_assets.push(input_asset.clone());
-        (input_id, input_asset)
+        new_assets.push(asset.clone());
+        asset
     };
 
     // Resolve, hash, and register each stem; they live as `<name>.wav` in the job
@@ -663,7 +663,7 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
 
     let derivation = Derivation {
         id: derivation_id.clone(),
-        inputs: vec![input_id],
+        inputs: vec![input_asset.id.clone()],
         outputs: stem_assets.iter().map(|a| a.id.clone()).collect(),
         tool: IMPORT_TOOL.to_string(),
         tool_version: Some(job.engine_version),
@@ -684,7 +684,7 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportReport, ImportError> 
     write_atomic(&manifest_path, bytes.as_bytes()).map_err(ImportError::Io)?;
 
     Ok(ImportReport {
-        input: input_report,
+        input: input_asset,
         stems: stem_assets,
         derivation_id,
     })
