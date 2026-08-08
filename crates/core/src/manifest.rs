@@ -571,10 +571,13 @@ impl From<LoadError> for ImportError {
 /// recording the separation with a hashed reference to the `job.json`. The
 /// `job.json` itself is referenced, never registered as an asset.
 ///
-/// Refuses — leaving the manifest byte-identical — when the job record is
-/// missing/unreadable/malformed, its `outcome` is not success, the input's
-/// current bytes do not match the recorded `input_sha256`, or any referenced file
-/// resolves outside the project root. Writes the updated manifest once, atomically.
+/// A `job.json` whose sha256 a derivation already records is a stated no-op:
+/// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
+/// is written. Otherwise refuses — leaving the manifest byte-identical — when the
+/// job record is missing/unreadable/malformed, its `outcome` is not success, the
+/// input's current bytes do not match the recorded `input_sha256`, any referenced
+/// file resolves outside the project root, or a referenced path is already
+/// registered with a conflicting hash. Writes the updated manifest once, atomically.
 pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let (_, mut manifest) = load_manifest(root)?;

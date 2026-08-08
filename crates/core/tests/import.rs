@@ -169,7 +169,6 @@ fn import_tolerates_unknown_extra_fields_in_the_job_record() {
 #[test]
 fn re_importing_the_same_job_is_a_stated_noop() {
     let dir = project();
-    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
     let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
 
     let first = match import(dir.path(), &job).unwrap() {
@@ -188,7 +187,6 @@ fn re_importing_the_same_job_is_a_stated_noop() {
 #[test]
 fn import_refuses_a_stem_path_registered_with_a_conflicting_hash() {
     let dir = project();
-    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
     let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
 
     // Register the stem path, then tamper with the file so the recorded hash and
@@ -207,5 +205,30 @@ fn import_refuses_a_stem_path_registered_with_a_conflicting_hash() {
             assert_ne!(registered, actual);
         }
         other => panic!("expected StemPathConflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_refuses_an_input_path_registered_with_a_conflicting_hash() {
+    let dir = project();
+    // Register the input path with different bytes, then let `synth_job` rewrite
+    // the file to match the job record: hash resolution finds no matching asset,
+    // and the path is taken by one recording a conflicting hash.
+    fs::write(dir.path().join("mix.wav"), b"original").unwrap();
+    add(dir.path(), Path::new("mix.wav"), None, "mix").unwrap();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+
+    let err = import(dir.path(), &job).unwrap_err();
+    match err {
+        ImportError::InputPathConflict {
+            path,
+            registered,
+            actual,
+        } => {
+            assert_eq!(path, "mix.wav");
+            assert_eq!(actual, HELLO_SHA256);
+            assert_ne!(registered, actual);
+        }
+        other => panic!("expected InputPathConflict, got {other:?}"),
     }
 }
