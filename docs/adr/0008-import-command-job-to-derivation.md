@@ -59,6 +59,9 @@ richer `show` rendering.
   reachable and tamper-evident — a manifest reader can detect a `job.json`
   edited after import.
 - `verify` (ADR-0006) and `show` (ADR-0007) cover imported assets and derivations
-  with no extra work: they are ordinary assets and an ordinary derivation. The
-  richer `show` rendering (preset, job ref) and the remaining contract behaviors
-  are deferred to later M2 slices.
+  with no extra work: they are ordinary assets and an ordinary derivation. Slice 4
+  grows `show`'s derivation overview to add a `preset:` line (from `params.preset`)
+  and a `job:` line (the hashed reference's path + sha256); both lines are emitted
+  only when present, so a hand-written derivation without them renders unchanged
+  and `show --json` stays a byte-exact pass-through. The remaining contract
+  behaviors are deferred to later M2 slices.

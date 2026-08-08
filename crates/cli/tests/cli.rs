@@ -897,6 +897,49 @@ fn import_leaves_the_project_verifiable_and_shown() {
     assert!(stdout.contains("uncompose"), "{stdout}");
 }
 
+// --- M2 slice 4: show renders the imported graph ---
+
+/// `show`'s overview of an imported derivation grows the preset and the hashed
+/// job reference (path + sha256), alongside the existing tool/version, inputs,
+/// outputs, and created line.
+#[test]
+fn show_renders_the_preset_and_job_ref_of_an_imported_derivation() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    assert!(run(dir.path(), &["import", &job]).status.success());
+
+    // The job ref's sha256 is whatever the importer hashed job.json to.
+    let manifest = read_manifest(dir.path());
+    let job_sha = manifest["derivations"][0]["job"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let show = run(dir.path(), &["show"]);
+    assert!(show.status.success());
+    let stdout = String::from_utf8(show.stdout).unwrap();
+    assert!(
+        stdout.contains("preset") && stdout.contains("studio"),
+        "overview should show the preset: {stdout}"
+    );
+    assert!(
+        stdout.contains("run1/job.json"),
+        "overview should show the job ref path: {stdout}"
+    );
+    assert!(
+        stdout.contains(&job_sha),
+        "overview should show the job ref sha256: {stdout}"
+    );
+}
+
 #[test]
 fn import_refuses_a_non_success_outcome_leaving_the_manifest_untouched() {
     let dir = init_project();
