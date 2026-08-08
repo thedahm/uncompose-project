@@ -417,12 +417,33 @@ struct JobRecord {
     finished_at_unix: u64,
 }
 
+/// How an import arrived at one of the assets it linked: by registering it, or by
+/// linking one the manifest already held. Import decides this per asset (the input
+/// by sha256, a stem by path) and the summary reports it, so a reader can tell a
+/// newly captured file from one already under the manifest's protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetOrigin {
+    /// This import registered the asset; it was not in the manifest before.
+    Registered,
+    /// The asset was already registered and was linked, not duplicated.
+    Existing,
+}
+
+/// One asset an import linked, paired with how import arrived at it.
+#[derive(Debug, Clone)]
+pub struct ImportedAsset {
+    pub asset: Asset,
+    pub origin: AssetOrigin,
+}
+
 /// The summary an `import` returns for the CLI to print: the resolved input, the
-/// registered stems, and the id of the derivation that ties them together.
+/// stems, and the id of the derivation that ties them together. Each asset
+/// carries its [`AssetOrigin`], so the summary can say whether the input resolved
+/// to an existing asset or was registered, and which stems were reused.
 #[derive(Debug)]
 pub struct ImportReport {
-    pub input: Asset,
-    pub stems: Vec<Asset>,
+    pub input: ImportedAsset,
+    pub stems: Vec<ImportedAsset>,
     pub derivation_id: String,
 }
 
@@ -444,6 +465,8 @@ pub enum ImportOutcome {
 pub enum ImportError {
     /// The manifest could not be read/parsed (see [`LoadError`]).
     Load(LoadError),
+    /// The `job.json` argument was absolute; paths are relative to the root.
+    JobAbsolutePath(PathBuf),
     /// No `job.json` at the given path.
     JobMissing(PathBuf),
     /// The `job.json` exists but could not be read.
@@ -456,6 +479,9 @@ pub enum ImportError {
     NotSuccess(String),
     /// `finished_at_unix` is not a representable timestamp.
     InvalidTimestamp(u64),
+    /// The job record's `input_path` was absolute; recorded paths are relative to
+    /// the root. Carries the record's own string, not a resolved path.
+    InputAbsolutePath(String),
     /// The job's input file is missing.
     InputMissing(PathBuf),
     /// The job's input file exists but could not be read to hash it.
@@ -497,11 +523,16 @@ impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ImportError::Load(e) => write!(f, "{e}"),
+            ImportError::JobAbsolutePath(p) => write!(
+                f,
+                "{} is an absolute path; pass a path relative to the project root",
+                p.display()
+            ),
             ImportError::JobMissing(p) => write!(f, "no such job record: {}", p.display()),
             ImportError::JobUnreadable(p, e) => write!(f, "cannot read {}: {e}", p.display()),
             ImportError::JobOutsideRoot(p) => write!(
                 f,
-                "{} resolves outside the project root; job records must live inside the project",
+                "{} resolves outside the project root; job records must live inside the project — move the job folder into the project root and import it from there",
                 p.display()
             ),
             ImportError::MalformedJob(p, e) => {
@@ -514,6 +545,10 @@ impl std::fmt::Display for ImportError {
             ImportError::InvalidTimestamp(secs) => write!(
                 f,
                 "job finished_at_unix {secs} is not a representable timestamp"
+            ),
+            ImportError::InputAbsolutePath(p) => write!(
+                f,
+                "the job records an absolute input_path ({p}); recorded paths must be relative to the project root — `uncompose-project add` the input so import resolves it by hash instead"
             ),
             ImportError::InputMissing(p) => write!(f, "input file not found: {}", p.display()),
             ImportError::InputUnreadable(p, e) => write!(f, "cannot read input {}: {e}", p.display()),
@@ -534,7 +569,7 @@ impl std::fmt::Display for ImportError {
             ImportError::StemUnreadable(p, e) => write!(f, "cannot read stem {}: {e}", p.display()),
             ImportError::StemOutsideRoot(p) => write!(
                 f,
-                "stem {} resolves outside the project root",
+                "stem {} resolves outside the project root; move the stem inside the project root — a symlink pointing out of the tree does not count — and re-import",
                 p.display()
             ),
             ImportError::InputPathConflict {
@@ -575,16 +610,22 @@ impl From<LoadError> for ImportError {
 /// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
 /// is written. Otherwise refuses — leaving the manifest byte-identical — when the
 /// job record is missing/unreadable/malformed, its `outcome` is not success, the
-/// input's current bytes do not match the recorded `input_sha256`, any referenced
-/// file resolves outside the project root, or a referenced path is already
-/// registered with a conflicting hash. Writes the updated manifest once, atomically.
+/// input's current bytes do not match the recorded `input_sha256`, the job
+/// argument or the record's `input_path` is absolute, any referenced file resolves
+/// outside the project root, or a referenced path is already registered with a
+/// conflicting hash. Writes the updated manifest once, atomically.
 pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
     let (_, mut manifest) = load_manifest(root)?;
 
     let canonical_root = root.canonicalize().map_err(ImportError::Io)?;
 
-    // Locate and read the job record.
+    // Locate and read the job record. An absolute argument refuses the same way
+    // `add` refuses one (ADR-0003): path arguments are relative to the project
+    // root, even when the absolute form happens to land inside it.
+    if job_arg.is_absolute() {
+        return Err(ImportError::JobAbsolutePath(job_arg.to_path_buf()));
+    }
     let (job_abs, job_rel) =
         canonical_inside(root, &canonical_root, job_arg).map_err(|k| match k {
             ResolveKind::Missing => ImportError::JobMissing(job_arg.to_path_buf()),
@@ -636,9 +677,17 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
         .iter()
         .find(|a| a.sha256 == job.input_sha256)
     {
-        existing.clone()
+        ImportedAsset {
+            asset: existing.clone(),
+            origin: AssetOrigin::Existing,
+        }
     } else {
         let input_candidate = PathBuf::from(&job.input_path);
+        // Same rule as the job argument: a recorded input path is root-relative,
+        // so an absolute one refuses rather than being silently resolved.
+        if input_candidate.is_absolute() {
+            return Err(ImportError::InputAbsolutePath(job.input_path.clone()));
+        }
         let (input_abs, input_rel) = canonical_inside(root, &canonical_root, &input_candidate)
             .map_err(|k| match k {
                 ResolveKind::Missing => ImportError::InputMissing(input_candidate.clone()),
@@ -683,7 +732,10 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
             ext: None,
         };
         new_assets.push(asset.clone());
-        asset
+        ImportedAsset {
+            asset,
+            origin: AssetOrigin::Registered,
+        }
     };
 
     // Resolve, hash, and register each stem; they live as `<name>.wav` in the job
@@ -707,12 +759,13 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
         // earlier this run) with a matching hash is reused rather than duplicated;
         // the same path with a conflicting hash refuses. Identical bytes at a
         // different path stay a distinct asset, since we match on path, not hash.
-        if let Some(existing) = manifest
+        let already = manifest
             .assets
             .iter()
-            .chain(new_assets.iter())
-            .find(|a| a.path == stem_rel)
-        {
+            .map(|a| (a, AssetOrigin::Existing))
+            .chain(new_assets.iter().map(|a| (a, AssetOrigin::Registered)))
+            .find(|(a, _)| a.path == stem_rel);
+        if let Some((existing, origin)) = already {
             if existing.sha256 != stem_hash {
                 return Err(ImportError::StemPathConflict {
                     path: stem_rel,
@@ -720,7 +773,10 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
                     actual: stem_hash,
                 });
             }
-            stem_assets.push(existing.clone());
+            stem_assets.push(ImportedAsset {
+                asset: existing.clone(),
+                origin,
+            });
             continue;
         }
         let id = mint_id_with(&slugify(name), |c| taken.contains(c));
@@ -736,7 +792,10 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
             ext: None,
         };
         new_assets.push(stem_asset.clone());
-        stem_assets.push(stem_asset);
+        stem_assets.push(ImportedAsset {
+            asset: stem_asset,
+            origin: AssetOrigin::Registered,
+        });
     }
 
     // The derivation ties the input to the stems; `params` carries only the
@@ -753,8 +812,8 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
 
     let derivation = Derivation {
         id: derivation_id.clone(),
-        inputs: vec![input_asset.id.clone()],
-        outputs: stem_assets.iter().map(|a| a.id.clone()).collect(),
+        inputs: vec![input_asset.asset.id.clone()],
+        outputs: stem_assets.iter().map(|a| a.asset.id.clone()).collect(),
         tool: IMPORT_TOOL.to_string(),
         tool_version: Some(job.engine_version),
         params: Some(params),

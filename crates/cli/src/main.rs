@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use uncompose_project_core::{
-    add, import, init, show, tagline, verify, ImportOutcome, Integrity, DEFAULT_ROLE,
+    add, import, init, show, tagline, verify, AssetOrigin, ImportOutcome, ImportedAsset, Integrity,
+    DEFAULT_ROLE,
 };
 
 #[derive(Parser)]
@@ -173,6 +174,28 @@ fn run_show(json: bool) -> ExitCode {
     }
 }
 
+/// Render an import's stem count with its registered/reused split — `2 stems: 1
+/// registered, 1 reused`. Zero-count halves are left out, so the common all-new
+/// case reads plainly and a stemless job still says `0 stems`.
+fn stem_tally(stems: &[ImportedAsset]) -> String {
+    let reused = stems
+        .iter()
+        .filter(|s| s.origin == AssetOrigin::Existing)
+        .count();
+    let registered = stems.len() - reused;
+    let noun = if stems.len() == 1 { "stem" } else { "stems" };
+    let parts: Vec<String> = [(registered, "registered"), (reused, "reused")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    if parts.is_empty() {
+        format!("{} {noun}", stems.len())
+    } else {
+        format!("{} {noun}: {}", stems.len(), parts.join(", "))
+    }
+}
+
 fn run_import(job: PathBuf) -> ExitCode {
     let Some(root) = project_root() else {
         return ExitCode::FAILURE;
@@ -180,14 +203,33 @@ fn run_import(job: PathBuf) -> ExitCode {
     match import(&root, &job) {
         Ok(ImportOutcome::Imported(report)) => {
             println!(
-                "Imported '{}' ({} stem{})",
+                "Imported '{}' ({})",
                 report.derivation_id,
-                report.stems.len(),
-                if report.stems.len() == 1 { "" } else { "s" }
+                stem_tally(&report.stems)
             );
-            println!("  input:      {} ({})", report.input.id, report.input.path);
+            // Whether each file was captured now or was already under the
+            // manifest's protection is the point of the summary, so every line
+            // says which: the input resolved to an existing asset or registered,
+            // each stem registered or reused.
+            println!(
+                "  input:      {} ({}) [{}]",
+                report.input.asset.id,
+                report.input.asset.path,
+                match report.input.origin {
+                    AssetOrigin::Registered => "registered",
+                    AssetOrigin::Existing => "resolved to an existing asset",
+                }
+            );
             for stem in &report.stems {
-                println!("  stem:       {} ({})", stem.id, stem.path);
+                println!(
+                    "  stem:       {} ({}) [{}]",
+                    stem.asset.id,
+                    stem.asset.path,
+                    match stem.origin {
+                        AssetOrigin::Registered => "registered",
+                        AssetOrigin::Existing => "reused",
+                    }
+                );
             }
             println!("  derivation: {}", report.derivation_id);
             ExitCode::SUCCESS

@@ -6,9 +6,9 @@
 pub mod manifest;
 
 pub use manifest::{
-    add, import, init, show, verify, AddError, Asset, AssetStatus, Derivation, ImportError,
-    ImportOutcome, ImportReport, InitError, Integrity, Job, LoadError, Manifest, Project,
-    ShowOutput, VerifyError, VerifyReport, DEFAULT_ROLE, SCHEMA_URL,
+    add, import, init, show, verify, AddError, Asset, AssetOrigin, AssetStatus, Derivation,
+    ImportError, ImportOutcome, ImportReport, ImportedAsset, InitError, Integrity, Job, LoadError,
+    Manifest, Project, ShowOutput, VerifyError, VerifyReport, DEFAULT_ROLE, SCHEMA_URL,
 };
 
 /// The fixed name of the project manifest at the root of an uncompose project.

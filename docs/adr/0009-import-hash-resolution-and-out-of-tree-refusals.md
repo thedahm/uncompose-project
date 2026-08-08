@@ -33,6 +33,14 @@ it names.
   therefore its job folder) or any `<stem>.wav` resolving outside the project root
   refuses, so every recorded path stays root-relative and portable.
 
+- **Absolute paths refuse, exactly as in `add` (ADR-0003).** "The same rule `add`
+  uses" includes its absolute-path refusal, not just the canonicalize-and-strip
+  confinement: both the `job.json` argument and the record's own `input_path` are
+  root-relative paths, so an absolute one refuses even when it would land inside
+  the root. Accepting it would make `import` quietly laxer than `add` about the
+  one path contract every command shares, and would let a job record's
+  machine-specific absolute path resolve on the machine that wrote it.
+
 - **Bad records fail naming the file and the cause.** A missing, unreadable, or
   unparsable `job.json`, or one missing a field the contract consumes, produces a
   distinct error naming the file and the problem — a bad path is told apart from a

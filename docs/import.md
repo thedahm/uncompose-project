@@ -18,9 +18,11 @@ uncompose project import path/to/run/job.json   # via the root CLI — identical
 ```
 
 The one argument is the path to a `job.json` written by a completed `uncompose`
-separation. It is relative to your current directory like every other command, but the
-job folder (the directory holding the `job.json`) and every file it names must sit
-inside the project root; import never copies files into the tree.
+separation. It is relative to your current directory like every other command, and it
+follows the same path rules as `add`: an absolute path is refused (even one that lands
+inside the project), as is anything resolving outside the root. The job folder (the
+directory holding the `job.json`) and every file it names must sit inside the project
+root; import never copies files into the tree.
 
 ## What import records
 
@@ -67,20 +69,27 @@ re-check it.
 ## Reading the summary
 
 A successful import prints the derivation, the resolved input, each stem, and the
-derivation id:
+derivation id — with a tag on each line saying whether import **registered** that file
+or linked one the manifest already held:
 
 ```
-Imported 'run-2026-08-08' (2 stems)
-  input:      mix (audio/mix.wav)
-  stem:       vocals (audio/run/vocals.wav)
-  stem:       drums (audio/run/drums.wav)
+Imported 'run-2026-08-08' (2 stems: 1 registered, 1 reused)
+  input:      mix (audio/mix.wav) [resolved to an existing asset]
+  stem:       vocals (audio/run/vocals.wav) [registered]
+  stem:       drums (audio/run/drums.wav) [reused]
   derivation: run-2026-08-08
 ```
 
+The input reads `[registered]` when import auto-registered it and
+`[resolved to an existing asset]` when a registered asset already matched the job's
+`input_sha256`; a stem reads `[registered]` or `[reused]` on the same distinction by
+path. The header repeats the split as a tally.
+
 From this you can trust the result without opening the manifest: which asset the source
-resolved to (or was registered as), how many stems landed and where, and the derivation
-that ties them together. `show` renders the same graph later, adding the `preset:` and
-`job:` lines from the derivation.
+resolved to (or was registered as), how many stems landed, where, and which of them were
+already under the manifest's protection, and the derivation that ties them together.
+`show` renders the same graph later, adding the `preset:` and `job:` lines from the
+derivation.
 
 ## Idempotency: safe re-runs
 
@@ -112,6 +121,7 @@ so pipelines can gate on it.
 | --- | --- | --- |
 | **Failed outcome** | The job's `outcome` is not `"success"` (the outcome is shown) | A run that did not complete successfully is never provenance. |
 | **Bad record** | The `job.json` is missing, unreadable, unparsable, or missing a required field (the file and problem are named) | You can tell a bad path from a corrupt record. |
+| **Absolute path** | The job argument, or the record's `input_path`, is absolute — even one landing inside the root | Import applies `add`'s path rules unchanged: paths are relative to the project root, so a project stays portable. |
 | **Job outside the root** | The `job.json` (and so its job folder) resolves outside the project root | Every recorded path stays root-relative and portable. |
 | **Stem outside the root** | A `<stem>.wav` resolves outside the project root | Same reason: the manifest never references files outside the tree. |
 | **Out-of-tree input** | No registered asset matches by hash **and** the job's `input_path` resolves outside the root | Import never copies files in; it tells you to `uncompose-project add` the input first. |
@@ -119,10 +129,10 @@ so pipelines can gate on it.
 | **Input path conflict** | The input's path is already registered with a different sha256 (both hashes named) | The manifest is never left quietly contradicting the disk. |
 | **Stem path conflict** | A stem's path is already registered with a different sha256 (both hashes named) | Same reason: a drifted file on a registered path is caught loudly. |
 
-From these rules you can predict every case: a failed run, a job or stem outside the
-root, an input that is neither registered nor in-tree, a file that has drifted since the
-separation, or a path already registered with different bytes each refuse with a clear
-message and no partial write. Everything else — a success whose input resolves by hash or
+From these rules you can predict every case: a failed run, an absolute path, a job or
+stem outside the root, an input that is neither registered nor in-tree, a file that has
+drifted since the separation, or a path already registered with different bytes each
+refuse with a clear message and no partial write. Everything else — a success whose input resolves by hash or
 auto-registers in place, with stems that are new or already registered at a matching
 hash — imports.
 

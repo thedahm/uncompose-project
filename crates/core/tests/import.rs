@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use tempfile::TempDir;
-use uncompose_project_core::{add, import, init, ImportError, ImportOutcome};
+use uncompose_project_core::{add, import, init, AssetOrigin, ImportError, ImportOutcome};
 
 /// sha256 of `b"hello"`.
 const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -231,4 +231,89 @@ fn import_refuses_an_input_path_registered_with_a_conflicting_hash() {
         }
         other => panic!("expected InputPathConflict, got {other:?}"),
     }
+}
+
+/// Absolute paths refuse the same way `add` refuses them, even when the absolute
+/// form lands inside the root — the spec pins import to `add`'s path rules.
+#[test]
+fn import_refuses_an_absolute_job_path_inside_the_root() {
+    let dir = project();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+    let abs = dir.path().join(&job);
+
+    let err = import(dir.path(), &abs).unwrap_err();
+    assert!(
+        matches!(err, ImportError::JobAbsolutePath(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("relative to the project root"),
+        "message should say what to pass instead: {err}"
+    );
+}
+
+/// Same rule for the path the record itself carries: an absolute `input_path` is
+/// refused rather than silently resolved, and the message points at `add`.
+#[test]
+fn import_refuses_an_absolute_input_path_in_the_record() {
+    let dir = project();
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    let job_dir = dir.path().join("run1");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(job_dir.join("vocals.wav"), b"vocals").unwrap();
+    let job = serde_json::json!({
+        "input_path": dir.path().join("mix.wav").to_str().unwrap(),
+        "input_sha256": HELLO_SHA256,
+        "preset": "studio",
+        "stems": ["vocals"],
+        "engine_version": "1",
+        "outcome": "success",
+        "finished_at_unix": 1,
+    });
+    fs::write(job_dir.join("job.json"), job.to_string()).unwrap();
+
+    let err = import(dir.path(), Path::new("run1/job.json")).unwrap_err();
+    assert!(
+        matches!(err, ImportError::InputAbsolutePath(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("add"),
+        "message should point at `add`: {err}"
+    );
+}
+
+/// A hash-matched input reports as existing while fresh stems report as
+/// registered, so the CLI summary can tell them apart (user story 18).
+#[test]
+fn the_report_marks_a_hash_matched_input_existing_and_new_stems_registered() {
+    let dir = project();
+    fs::write(dir.path().join("original.wav"), b"hello").unwrap();
+    add(dir.path(), Path::new("original.wav"), None, "mix").unwrap();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+
+    let report = match import(dir.path(), &job).unwrap() {
+        ImportOutcome::Imported(r) => r,
+        other => panic!("expected an import, got {other:?}"),
+    };
+    assert_eq!(report.input.asset.id, "original");
+    assert_eq!(report.input.origin, AssetOrigin::Existing);
+    assert_eq!(report.stems.len(), 1);
+    assert_eq!(report.stems[0].origin, AssetOrigin::Registered);
+}
+
+/// A stem already registered at its path (matching hash) is reused, and the
+/// report says so rather than claiming a fresh registration.
+#[test]
+fn the_report_marks_an_already_registered_stem_existing() {
+    let dir = project();
+    let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+    add(dir.path(), Path::new("run1/vocals.wav"), None, "stem").unwrap();
+
+    let report = match import(dir.path(), &job).unwrap() {
+        ImportOutcome::Imported(r) => r,
+        other => panic!("expected an import, got {other:?}"),
+    };
+    assert_eq!(report.input.origin, AssetOrigin::Registered);
+    assert_eq!(report.stems[0].origin, AssetOrigin::Existing);
 }

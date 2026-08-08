@@ -810,6 +810,16 @@ fn import_lands_input_stems_and_a_derivation_in_one_step() {
         stdout.contains("vocals") && stdout.contains("drums"),
         "{stdout}"
     );
+    // …and says what happened to each: nothing was registered before this run.
+    assert!(
+        stdout.contains("2 stems: 2 registered"),
+        "summary should tally the stems: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[registered]").count(),
+        3,
+        "input and both stems are newly registered: {stdout}"
+    );
 
     let manifest = read_manifest(dir.path());
 
@@ -1064,6 +1074,13 @@ fn import_reuses_a_registered_asset_matching_the_input_hash() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // The summary distinguishes a resolved input from a registered one.
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("input:      original (original.wav) [resolved to an existing asset]"),
+        "summary should say the input resolved, not registered: {stdout}"
+    );
+
     let manifest = read_manifest(dir.path());
     let assets = manifest["assets"].as_array().unwrap();
     // Only the pre-registered input and the one stem — `mix.wav` is not added.
@@ -1078,6 +1095,41 @@ fn import_reuses_a_registered_asset_matching_the_input_hash() {
     let d = &manifest["derivations"].as_array().unwrap()[0];
     assert_eq!(d["inputs"], serde_json::json!(["original"]));
     assert_valid_against_schema(&manifest);
+}
+
+/// Acceptance: import applies `add`'s path rules, so an absolute job path refuses
+/// even when it lands inside the root; the manifest is left byte-identical.
+#[test]
+fn import_refuses_an_absolute_job_path() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let abs = dir.path().join(&job);
+
+    let output = run(dir.path(), &["import", abs.to_str().unwrap()]);
+    assert!(
+        !output.status.success(),
+        "an absolute job path should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("absolute path") && stderr.contains("relative to the project root"),
+        "error should say what to pass instead: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused import leaves the manifest untouched"
+    );
 }
 
 /// Acceptance: a job folder outside the project root refuses; the manifest is
@@ -1225,6 +1277,13 @@ fn import_reuses_a_same_path_same_hash_stem_asset() {
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The summary marks the overlapping stem reused rather than registered.
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("1 stem: 1 reused") && stdout.contains("[reused]"),
+        "summary should say the stem was reused: {stdout}"
     );
 
     let manifest = read_manifest(dir.path());
