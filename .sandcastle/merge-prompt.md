@@ -12,11 +12,15 @@ For each branch, one at a time:
 4. If GitHub reports the PR is not mergeable because of conflicts, resolve them locally first:
    - `git checkout <branch>` then `git merge {{SPEC_BRANCH}} --no-edit`
    - Resolve conflicts intelligently by reading both sides and choosing the correct resolution
-   - Run `npm run typecheck` and `npm run test`; fix failures before continuing
+   - Run the repo checks (below); fix failures before continuing
    - `git push`, switch back to `{{SPEC_BRANCH}}`, and merge the PR as in step 3
 5. After the PR merges, `git checkout {{SPEC_BRANCH}} && git pull` so the next branch merges against the latest state
 
-After all branches are merged, run `npm run typecheck` and `npm run test` on `{{SPEC_BRANCH}}` one final time. If something fails, fix it, commit, and push.
+After all branches are merged, run the repo checks on `{{SPEC_BRANCH}}` one final time. If something fails, fix it, commit, and push.
+
+# REPO CHECKS
+
+`cargo test` at the repo root runs everything, plus `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (see CONTRIBUTING.md). If the touched code has other documented checks (e.g. Python packaging via `ci/smoke-wheel.sh`), run those too.
 
 # CLOSE ISSUES
 

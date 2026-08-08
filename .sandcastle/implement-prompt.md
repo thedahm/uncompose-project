@@ -35,7 +35,7 @@ If applicable, use RGR (or the /tdd skill) to complete the task.
 
 # FEEDBACK LOOPS
 
-Before committing, run `npm run typecheck` and `npm run test` to ensure the tests pass.
+Before committing, run the repo checks: `cargo test`, `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets -- -D warnings` (see CONTRIBUTING.md), plus any other documented checks for the surfaces you touched.
 
 # COMMIT
 

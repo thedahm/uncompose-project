@@ -25,7 +25,7 @@ Break the review into discrete actionable items. Classify each: **blocking** (a 
 
 # 4. ACT
 
-Apply the adopted changes on `{{SPEC_BRANCH}}`. Run `npm run typecheck` and `npm run test` before pushing. Commit with a message referencing the final review, then push.
+Apply the adopted changes on `{{SPEC_BRANCH}}`. Before pushing, run the repo checks: `cargo test`, `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets -- -D warnings` (see CONTRIBUTING.md), plus any other documented checks for the surfaces you touched. Commit with a message referencing the final review, then push.
 
 # 5. REPLY
 
