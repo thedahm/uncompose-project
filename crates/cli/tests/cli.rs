@@ -124,7 +124,14 @@ exec "uncompose-$sub" "$@"
 fn root_dispatch_delegates_preserving_args_and_exit_codes() {
     let (_shim_dir, shim, path) = install_dispatch_shim();
     let dispatch = |dir: &Path, args: &[&str]| -> Output {
-        Command::new(&shim)
+        // Invoke the shim through `sh <shim>` rather than exec'ing it directly.
+        // A direct exec of a file just written by this test races other tests'
+        // fork()s, which transiently inherit the still-open writable fd and make
+        // the kernel refuse the exec with ETXTBSY ("Text file busy"). Running it
+        // via the shell (which only opens the shim for reading, matching its
+        // `#!/bin/sh` shebang) is behaviorally identical and race-free.
+        Command::new("/bin/sh")
+            .arg(&shim)
             .args(args)
             .env("PATH", &path)
             .current_dir(dir)
