@@ -1,0 +1,24 @@
+[package]
+name = "uncompose-project"
+description = "Local-first CLI that records and verifies the provenance of derived audio via a portable project manifest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "uncompose-project"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+uncompose-project-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+jsonschema = "0.26"

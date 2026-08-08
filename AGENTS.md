@@ -1,7 +1,9 @@
-# uncompose-project
+# Uncompose Project
 
-Agent instructions for this repo are canonical in [`AGENTS.md`](AGENTS.md). This file
-points there and keeps the Agent skills block below in sync with it.
+Local-first provenance for derived audio.
+
+This is the canonical agent-instructions file for `uncompose-project`, per Uncompose
+family convention. `CLAUDE.md` points here.
 
 ## Agent skills
 

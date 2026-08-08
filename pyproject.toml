@@ -1,0 +1,39 @@
+# maturin bin-bindings packaging for the `uncompose-project` CLI.
+#
+# The wheel ships the compiled `uncompose-project` binary (built from the CLI
+# crate) as a console entry point, so `pip install uncompose-project` yields a
+# working binary on PATH. v0.1 targets Linux x86_64 (manylinux) only.
+#
+# The distribution version is read from Cargo.toml (`dynamic = ["version"]`), so
+# the Rust workspace is the single source of truth — nothing to keep in sync.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "uncompose-project"
+description = "Local-first CLI that records and verifies the provenance of derived audio via a portable project manifest."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Dominic Hanzely" }]
+keywords = ["audio", "provenance", "manifest", "uncompose"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Utilities",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/thedahm/uncompose-project"
+Repository = "https://github.com/thedahm/uncompose-project"
+
+[tool.maturin]
+# Package the CLI crate's binary (no Python extension module).
+bindings = "bin"
+manifest-path = "crates/cli/Cargo.toml"
