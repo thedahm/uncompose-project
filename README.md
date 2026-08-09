@@ -27,10 +27,12 @@ pip install uncompose-project        # placeholder — lands with v0.1.0
 ## Commands
 
 `init` creates a project, `add` registers a file as an asset, `verify` checks the
-registered assets against disk, and `show` renders the manifest. `import` reads a
-completed `uncompose` job record and lands its source, output stems, and their
-derivation in one step — see [Importing a job](docs/import.md) for what it records, what
-it refuses and why, and how re-import stays idempotent.
+registered assets (and any imported comparison records) against disk, and `show` renders
+the manifest. `import` reads an evidence file and, by its `schema`, lands either a
+completed `uncompose` job record (its source, output stems, and their derivation) or a
+`uncompose-compare` comparison record (an evaluation of assets it already tracks) in one
+step — see [Importing evidence](docs/import.md) for what each records, what they refuse
+and why, and how re-import stays idempotent.
 
 Every command takes `--project <dir>` (default `.`) to name the project root explicitly,
 so you can operate on a project from any directory; it names the root itself, with no

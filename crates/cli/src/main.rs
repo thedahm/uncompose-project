@@ -127,9 +127,10 @@ fn run_verify(root: &Path) -> ExitCode {
     };
 
     // Passes to stdout; failures to stderr as warnings naming path and cause.
+    // Evaluation record files (report.records) are policed the same way as assets.
     let mut modified = 0;
     let mut missing = 0;
-    for status in &report.statuses {
+    for status in report.statuses.iter().chain(&report.records) {
         match status.integrity {
             Integrity::Verified => println!("verified  {}", status.path),
             Integrity::Modified => {
@@ -235,6 +236,29 @@ fn run_import(root: &Path, job: PathBuf) -> ExitCode {
         }
         Ok(ImportOutcome::AlreadyImported { derivation_id }) => {
             println!("Already imported as '{derivation_id}'; job.json unchanged, nothing to do");
+            ExitCode::SUCCESS
+        }
+        Ok(ImportOutcome::EvaluationImported(report)) => {
+            println!("Imported evaluation '{}'", report.evaluation_id);
+            println!("  candidates: {}", report.candidates.join(", "));
+            println!(
+                "  preference: {}",
+                report.preference.as_deref().unwrap_or("none")
+            );
+            if let Some(confidence) = &report.confidence {
+                // A string confidence prints bare; anything else as compact JSON.
+                match confidence.as_str() {
+                    Some(s) => println!("  confidence: {s}"),
+                    None => println!("  confidence: {confidence}"),
+                }
+            }
+            println!("  evaluation: {}", report.evaluation_id);
+            ExitCode::SUCCESS
+        }
+        Ok(ImportOutcome::EvaluationAlreadyImported { evaluation_id }) => {
+            println!(
+                "Already imported as evaluation '{evaluation_id}'; record unchanged, nothing to do"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

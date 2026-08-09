@@ -1,10 +1,10 @@
 //! The project manifest: its in-memory shape, canonical serialization, and the
 //! `init`/`add` operations that write it atomically.
 //!
-//! Only what M1's commands need is modeled here. `init` mints an empty manifest
-//! and `add` registers assets; no M1 command creates derivations or evaluations,
-//! but both are parsed strictly against schema v0 and round-tripped, so an
-//! off-shape record is rejected rather than silently carried and re-emitted.
+//! `init` mints an empty manifest, `add` registers assets, and `import` records
+//! derivations (from a job record) and evaluations (from a compare record). Every
+//! object is parsed strictly against schema v0 and round-tripped, so an off-shape
+//! record is rejected rather than silently carried and re-emitted.
 //!
 //! Reads are strict: the manifest's `schema` URL is matched exactly against
 //! [`SCHEMA_URL`] and any plain field outside the v0 shape is rejected, so the
@@ -49,9 +49,10 @@ pub struct Manifest {
     pub project: Project,
     pub assets: Vec<Asset>,
     pub derivations: Vec<Derivation>,
-    /// Reserved: the item shape is owned by uncompose#63 (M2 import). Until then
-    /// any object round-trips; a non-object item is rejected per the schema.
-    pub evaluations: Vec<Map<String, Value>>,
+    /// Comparison verdicts imported from compare records (uncompose#65). Held to
+    /// the same strict v0 shape as everything else, so an off-shape evaluation is
+    /// rejected on read rather than silently carried.
+    pub evaluations: Vec<Evaluation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<Map<String, Value>>,
 }
@@ -115,6 +116,42 @@ pub struct Derivation {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    pub path: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Map<String, Value>>,
+}
+
+/// A comparison verdict imported from a compare record (uncompose#65): which
+/// assets were compared, which one was preferred, and a hashed reference to the
+/// record file that holds the full observations. The verdict is summarized here;
+/// the evidence stays in the record behind the ref. Field order matches the
+/// schema's canonical order.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evaluation {
+    pub id: String,
+    /// The compared assets' ids, in the record's candidate order.
+    pub candidates: Vec<String>,
+    /// The preferred candidate's asset id, or `null` when the record states no
+    /// preference. Always serialized (`null` stays `null`).
+    #[serde(default)]
+    pub preference: Option<String>,
+    /// Copied verbatim from the record when present; the compare schema owns its
+    /// type. Absent when the record carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Value>,
+    pub created_at: String,
+    pub record: EvalRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Map<String, Value>>,
+}
+
+/// A hashed reference to an imported comparison record — referenced, never
+/// absorbed, so `verify` can police it and the observations stay in the file.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalRecord {
     pub path: String,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,6 +441,12 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     Ok(asset)
 }
 
+/// The absolute schema URL a compare-record v0 file carries (uncompose#65),
+/// compared by exact string match. Its presence in an imported file dispatches
+/// the import to the evaluation path; a file with no `schema` is a job record.
+pub const COMPARE_SCHEMA_URL: &str =
+    "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json";
+
 /// The tool recorded on derivations created by `import`; the only producer of
 /// job records this importer trusts (uncompose#63).
 const IMPORT_TOOL: &str = "uncompose";
@@ -437,6 +480,39 @@ struct JobRecord {
     finished_at_unix: u64,
 }
 
+/// A parsed compare record (uncompose#65) — the verdict `uncompose-compare`
+/// writes. Only the fields the evaluation import consumes are modeled; unknown
+/// fields are tolerated (not `deny_unknown_fields`) because the format is owned
+/// by Compare and import treats it as evidence, not a manifest it owns. The full
+/// observations stay in the file behind the hashed ref.
+#[derive(Deserialize)]
+struct CompareRecord {
+    /// The compared candidates, in order; each names the asset it points at.
+    candidates: Vec<CompareCandidate>,
+    /// The preferred candidate's label, resolved through `candidates` to an asset
+    /// id. Absent or `null` means the record states no preference. Accepted under
+    /// either `preference` or `label`, since the contract names it "the record's
+    /// label" (uncompose#65) while the manifest field is `preference`.
+    #[serde(default, alias = "label")]
+    preference: Option<String>,
+    /// The record's confidence, copied verbatim into the evaluation when present.
+    #[serde(default)]
+    confidence: Option<Value>,
+    /// Completion time (RFC3339); the evaluation's `created_at`.
+    completed_at: String,
+}
+
+/// One candidate in a compare record: a `label` the record's `preference` may
+/// name, and the `asset` id it refers to. v0.1 registers project-launched records
+/// only, so a candidate without an `asset` ref is refused.
+#[derive(Deserialize)]
+struct CompareCandidate {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    asset: Option<String>,
+}
+
 /// How an import arrived at one of the assets it linked: by registering it, or by
 /// linking one the manifest already held. Import decides this per asset (the input
 /// by sha256, a stem by path) and the summary reports it, so a reader can tell a
@@ -467,9 +543,20 @@ pub struct ImportReport {
     pub derivation_id: String,
 }
 
-/// The result of an `import`: either a fresh import that wrote the manifest, or a
-/// stated no-op because a derivation already records this exact `job.json`
-/// (matched on its sha256). The idempotency key lets scripts re-run import safely.
+/// The summary an evaluation import returns for the CLI to print: the new
+/// evaluation's id, the compared asset ids, and the resolved preference.
+#[derive(Debug)]
+pub struct EvaluationReport {
+    pub evaluation_id: String,
+    pub candidates: Vec<String>,
+    pub preference: Option<String>,
+    pub confidence: Option<Value>,
+}
+
+/// The result of an `import`. `import` is one verb over two kinds of evidence
+/// (uncompose#65): a job record produces a derivation, a compare record produces
+/// an evaluation. Either kind can be a stated no-op when its hashed evidence is
+/// already recorded, letting scripts re-run import safely.
 #[derive(Debug)]
 pub enum ImportOutcome {
     /// The job was imported; the manifest was written.
@@ -477,6 +564,11 @@ pub enum ImportOutcome {
     /// A derivation already records this `job.json` (same sha256); nothing was
     /// written. The existing derivation's id is named.
     AlreadyImported { derivation_id: String },
+    /// A compare record was imported as an evaluation; the manifest was written.
+    EvaluationImported(Box<EvaluationReport>),
+    /// An evaluation already records this compare file (same sha256); nothing was
+    /// written. The existing evaluation's id is named.
+    EvaluationAlreadyImported { evaluation_id: String },
 }
 
 /// Why an `import` could not run. Every variant is raised before any write, so a
@@ -533,6 +625,20 @@ pub enum ImportError {
         registered: String,
         actual: String,
     },
+    /// The imported file declares a top-level `schema` this tool does not import.
+    /// A job record has no `schema`; a compare record carries [`COMPARE_SCHEMA_URL`].
+    UnrecognizedImportSchema { found: String },
+    /// A compare record is not valid JSON, or is missing a field the evaluation
+    /// import requires.
+    MalformedRecord(PathBuf, serde_json::Error),
+    /// A compare record has a candidate with no `asset` ref; v0.1 registers
+    /// project-launched records only.
+    CandidateMissingAsset,
+    /// A compare record references an asset id absent from the manifest.
+    UnknownAsset(String),
+    /// A compare record's `preference` label matches no candidate, so it cannot be
+    /// mapped to an asset id.
+    UnknownPreference(String),
     /// Writing the manifest failed.
     Io(io::Error),
 }
@@ -601,6 +707,25 @@ impl std::fmt::Display for ImportError {
                 f,
                 "stem {path} is registered with sha256 {registered} but the file now hashes to {actual}; resolve the conflict before importing"
             ),
+            ImportError::UnrecognizedImportSchema { found } => write!(
+                f,
+                "the file declares schema '{found}', which import does not recognize; expected a job record (no 'schema' field) or a compare record ('{COMPARE_SCHEMA_URL}')"
+            ),
+            ImportError::MalformedRecord(p, e) => {
+                write!(f, "{} is not a valid comparison record: {e}", p.display())
+            }
+            ImportError::CandidateMissingAsset => write!(
+                f,
+                "a comparison candidate has no 'asset' reference; only project-launched records (every candidate an asset in this project) can be imported"
+            ),
+            ImportError::UnknownAsset(id) => write!(
+                f,
+                "the comparison record references asset '{id}', which is not registered in this project; `uncompose-project add` it first"
+            ),
+            ImportError::UnknownPreference(label) => write!(
+                f,
+                "the comparison record prefers candidate '{label}', which is not among its candidates"
+            ),
             ImportError::Io(e) => write!(f, "failed to write manifest: {e}"),
         }
     }
@@ -614,11 +739,18 @@ impl From<LoadError> for ImportError {
     }
 }
 
-/// Import a completed `uncompose` job at `job_arg` (relative to `root`, or an
-/// absolute path resolving inside it): register its input as a `mix` asset, each
-/// stem as a `stem` asset, and one derivation recording the separation with a
-/// hashed reference to the `job.json`. The `job.json` itself is referenced,
-/// never registered as an asset.
+/// Import an evidence file at `job_arg` (relative to `root`, or an absolute path
+/// resolving inside it). One verb over two kinds of evidence, dispatched on the
+/// file's top-level `schema` (uncompose#65):
+///
+/// - **No `schema`** — a `job.json`: register its input as a `mix` asset, each
+///   stem as a `stem` asset, and one derivation recording the separation with a
+///   hashed reference to the `job.json`. Byte-for-byte the original import path,
+///   so old job folders stay importable forever.
+/// - **[`COMPARE_SCHEMA_URL`]** — a compare record: append one evaluation (see
+///   [`import_evaluation`]).
+/// - **Any other value** — refused as [`ImportError::UnrecognizedImportSchema`],
+///   naming the URL found.
 ///
 /// A `job.json` whose sha256 a derivation already records is a stated no-op:
 /// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
@@ -662,7 +794,30 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
         .map_err(|e| ImportError::JobUnreadable(job_arg.to_path_buf(), e))?;
     let job_sha256 = sha256_hex(&job_bytes);
 
-    let job: JobRecord = serde_json::from_slice(&job_bytes)
+    // Dispatch on the file's top-level `schema` (uncompose#65). A compare record
+    // carries COMPARE_SCHEMA_URL and imports as an evaluation; a file with no
+    // `schema` is a job record and follows the path below unchanged; any other
+    // value is refused. Parse to a generic value first so the check needs neither
+    // record type — invalid JSON still surfaces as a malformed job argument.
+    let value: Value = serde_json::from_slice(&job_bytes)
+        .map_err(|e| ImportError::MalformedJob(job_arg.to_path_buf(), e))?;
+    let schema = value
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match schema.as_deref() {
+        Some(COMPARE_SCHEMA_URL) => {
+            return import_evaluation(root, &manifest_path, job_arg, job_rel, job_sha256, value);
+        }
+        Some(found) => {
+            return Err(ImportError::UnrecognizedImportSchema {
+                found: found.to_string(),
+            });
+        }
+        None => {}
+    }
+
+    let job: JobRecord = serde_json::from_value(value)
         .map_err(|e| ImportError::MalformedJob(job_arg.to_path_buf(), e))?;
 
     // A run that did not complete successfully is never recorded as provenance.
@@ -890,6 +1045,119 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
     })))
 }
 
+/// Import a compare record (uncompose#65) as one manifest evaluation. The record
+/// file has already been located, read, and hashed by [`import`]; `record_rel` is
+/// its root-relative path and `record_sha256` the sha256 of its exact bytes.
+///
+/// Summarizes the verdict — the compared asset ids, the preferred one, and the
+/// confidence — and references the record file behind a hashed ref, so the
+/// observations, loops, and playback stay in the file and `verify` can police it.
+/// A record whose sha256 an evaluation already carries is a stated no-op
+/// ([`ImportOutcome::EvaluationAlreadyImported`]); the same path with different
+/// bytes appends a second evaluation. Refuses — leaving the manifest
+/// byte-identical — a malformed record, a candidate with no `asset` ref, a
+/// referenced asset id absent from the manifest, or a preference label naming no
+/// candidate. Writes the manifest once, atomically.
+fn import_evaluation(
+    root: &Path,
+    manifest_path: &Path,
+    record_arg: &Path,
+    record_rel: String,
+    record_sha256: String,
+    value: Value,
+) -> Result<ImportOutcome, ImportError> {
+    // Pre-lock: parse and structurally validate the record; none of this needs
+    // the manifest, matching the job path's pre-lock work (ADR-0011).
+    let record: CompareRecord = serde_json::from_value(value)
+        .map_err(|e| ImportError::MalformedRecord(record_arg.to_path_buf(), e))?;
+
+    // v0.1 registers project-launched records only: every candidate must name an
+    // asset. Collect the referenced ids in candidate order.
+    let mut candidate_assets = Vec::with_capacity(record.candidates.len());
+    for c in &record.candidates {
+        match &c.asset {
+            Some(a) => candidate_assets.push(a.clone()),
+            None => return Err(ImportError::CandidateMissingAsset),
+        }
+    }
+
+    // Resolve the preferred candidate's label to an asset id through the record's
+    // own candidates; a null/absent preference stays null.
+    let preference = match &record.preference {
+        None => None,
+        Some(label) => Some(
+            record
+                .candidates
+                .iter()
+                .find(|c| c.label.as_deref() == Some(label.as_str()))
+                .and_then(|c| c.asset.clone())
+                .ok_or_else(|| ImportError::UnknownPreference(label.clone()))?,
+        ),
+    };
+
+    // --- Under the exclusive project lock: the read-modify-write. The manifest is
+    // read fresh so a concurrent mutator's evaluations/assets are visible.
+    let _lock = ProjectLock::acquire(root).map_err(ImportError::Io)?;
+    let (_, mut manifest) = load_manifest(root)?;
+
+    // Idempotency (uncompose#65): an evaluation already recording this file (same
+    // sha256) is the same import already done — a stated no-op, no write. A
+    // different sha256 at the same path is a genuinely different verdict.
+    if let Some(existing) = manifest
+        .evaluations
+        .iter()
+        .find(|e| e.record.sha256 == record_sha256)
+    {
+        return Ok(ImportOutcome::EvaluationAlreadyImported {
+            evaluation_id: existing.id.clone(),
+        });
+    }
+
+    // Every referenced asset must be registered here — the verdict links to assets
+    // this project already protects, never dangling ids.
+    let known: HashSet<&str> = manifest.assets.iter().map(|a| a.id.as_str()).collect();
+    for id in &candidate_assets {
+        if !known.contains(id.as_str()) {
+            return Err(ImportError::UnknownAsset(id.clone()));
+        }
+    }
+
+    // The id names the matchup: `<a>-vs-<b>` from the candidate asset ids,
+    // disambiguated against existing evaluation ids by the numeric-suffix rule.
+    let base = slugify(&candidate_assets.join("-vs-"));
+    let taken: HashSet<&str> = manifest.evaluations.iter().map(|e| e.id.as_str()).collect();
+    let evaluation_id = mint_id_with(&base, |c| taken.contains(c));
+
+    // Confidence is copied only when the record actually carries one.
+    let confidence = record.confidence.filter(|v| !v.is_null());
+
+    manifest.evaluations.push(Evaluation {
+        id: evaluation_id.clone(),
+        candidates: candidate_assets.clone(),
+        preference: preference.clone(),
+        confidence: confidence.clone(),
+        created_at: record.completed_at,
+        record: EvalRecord {
+            path: record_rel,
+            sha256: record_sha256,
+            ext: None,
+        },
+        ext: None,
+    });
+
+    let bytes = manifest.to_canonical_json();
+    write_atomic(manifest_path, bytes.as_bytes()).map_err(ImportError::Io)?;
+
+    Ok(ImportOutcome::EvaluationImported(Box::new(
+        EvaluationReport {
+            evaluation_id,
+            candidates: candidate_assets,
+            preference,
+            confidence,
+        },
+    )))
+}
+
 /// Why [`canonical_inside`] could not resolve a path; each caller maps it into a
 /// context-specific error (`add`'s path, or import's input vs stem vs job record).
 enum ResolveKind {
@@ -960,18 +1228,24 @@ pub struct AssetStatus {
     pub integrity: Integrity,
 }
 
-/// The result of a `verify`: a per-asset integrity status in manifest order.
+/// The result of a `verify`: a per-asset integrity status in manifest order, plus
+/// the same for each imported evaluation's hashed record file, so a drifted or
+/// deleted comparison record is policed like any other tracked file.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
     pub statuses: Vec<AssetStatus>,
+    /// One status per evaluation record file (id = the evaluation id, path = the
+    /// record's root-relative path), in manifest order.
+    pub records: Vec<AssetStatus>,
 }
 
 impl VerifyReport {
-    /// Whether every asset verified. `verify` callers exit non-zero when this is
-    /// false so scripts and CI can gate on project integrity.
+    /// Whether every asset and every evaluation record verified. `verify` callers
+    /// exit non-zero when this is false so scripts and CI can gate on integrity.
     pub fn all_verified(&self) -> bool {
         self.statuses
             .iter()
+            .chain(&self.records)
             .all(|s| s.integrity == Integrity::Verified)
     }
 }
@@ -1039,7 +1313,36 @@ pub fn verify(root: &Path) -> Result<VerifyReport, VerifyError> {
         write_atomic(&manifest_path, bytes.as_bytes()).map_err(VerifyError::Io)?;
     }
 
-    Ok(VerifyReport { statuses })
+    // Evaluation record files are checked too, but never stamped: the manifest
+    // carries no size or `last_verified` for them, only the hashed ref, so a
+    // missing file reads missing and a byte change reads modified.
+    let mut records = Vec::with_capacity(manifest.evaluations.len());
+    for evaluation in &manifest.evaluations {
+        let integrity = check_record_integrity(root, &evaluation.record)?;
+        records.push(AssetStatus {
+            id: evaluation.id.clone(),
+            path: evaluation.record.path.clone(),
+            integrity,
+        });
+    }
+
+    Ok(VerifyReport { statuses, records })
+}
+
+/// Derive an evaluation record file's integrity from disk. Unlike an asset the
+/// manifest records no size for it, only the hashed ref, so there is no
+/// size-first shortcut: a file that is not there is [`Integrity::Missing`]; bytes
+/// that no longer hash to the recorded sha256 are [`Integrity::Modified`].
+fn check_record_integrity(root: &Path, record: &EvalRecord) -> Result<Integrity, VerifyError> {
+    // Stored paths are forward-slash and root-relative; rebuild per-OS components.
+    let rel: PathBuf = record.path.split('/').collect();
+    let path = root.join(rel);
+    match sha256_file(&path) {
+        Ok((sha256, _)) if sha256 == record.sha256 => Ok(Integrity::Verified),
+        Ok(_) => Ok(Integrity::Modified),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Integrity::Missing),
+        Err(e) => Err(VerifyError::Unreadable(path, e)),
+    }
 }
 
 /// Derive one asset's integrity from disk: size first (cheap), then sha256. A
@@ -1121,8 +1424,40 @@ fn render_overview(m: &Manifest) -> String {
             render_derivation(&mut o, d);
         }
     }
+    o.push('\n');
+
+    if m.evaluations.is_empty() {
+        let _ = writeln!(o, "Evaluations (0): none");
+    } else {
+        let _ = writeln!(o, "Evaluations ({}):", m.evaluations.len());
+        for e in &m.evaluations {
+            render_evaluation(&mut o, e);
+        }
+    }
 
     o
+}
+
+/// Render one evaluation: id header, then the compared candidates, the preferred
+/// asset (or `none`), the confidence when present, and the hashed record
+/// reference (path + sha256).
+fn render_evaluation(o: &mut String, e: &Evaluation) {
+    use std::fmt::Write;
+    let _ = writeln!(o, "  {}", e.id);
+    let _ = writeln!(o, "    candidates: {}", e.candidates.join(", "));
+    let _ = writeln!(
+        o,
+        "    preference: {}",
+        e.preference.as_deref().unwrap_or("none")
+    );
+    if let Some(confidence) = &e.confidence {
+        let _ = writeln!(o, "    confidence: {}", render_scalar(confidence));
+    }
+    let _ = writeln!(
+        o,
+        "    record:     {} (sha256 {})",
+        e.record.path, e.record.sha256
+    );
 }
 
 /// Render one derivation: id and tool header, then inputs, outputs, and when it
@@ -1199,6 +1534,13 @@ fn validate_ext_keys(manifest: &Manifest) -> Result<(), LoadError> {
         if let Some(job) = &d.job {
             check_ext(&format!("derivation '{}' job", d.id), job.ext.as_ref())?;
         }
+    }
+    for e in &manifest.evaluations {
+        check_ext(&format!("evaluation '{}'", e.id), e.ext.as_ref())?;
+        check_ext(
+            &format!("evaluation '{}' record", e.id),
+            e.record.ext.as_ref(),
+        )?;
     }
     Ok(())
 }

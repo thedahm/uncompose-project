@@ -9,8 +9,9 @@ pub mod manifest;
 pub use lock::{ProjectLock, LOCK_WAIT_NOTICE};
 pub use manifest::{
     add, import, init, show, verify, AddError, Asset, AssetOrigin, AssetStatus, Derivation,
-    ImportError, ImportOutcome, ImportReport, ImportedAsset, InitError, Integrity, Job, LoadError,
-    Manifest, Project, ShowOutput, VerifyError, VerifyReport, DEFAULT_ROLE, SCHEMA_URL,
+    EvalRecord, Evaluation, EvaluationReport, ImportError, ImportOutcome, ImportReport,
+    ImportedAsset, InitError, Integrity, Job, LoadError, Manifest, Project, ShowOutput,
+    VerifyError, VerifyReport, COMPARE_SCHEMA_URL, DEFAULT_ROLE, SCHEMA_URL,
 };
 
 /// The fixed name of the project manifest at the root of an uncompose project.
