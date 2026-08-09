@@ -7,7 +7,9 @@ use std::fs;
 use std::path::Path;
 
 use tempfile::TempDir;
-use uncompose_project_core::{add, import, init, AssetOrigin, ImportError, ImportOutcome};
+use uncompose_project_core::{
+    add, import, init, AssetOrigin, ImportError, ImportOutcome, COMPARE_SCHEMA_URL,
+};
 
 /// sha256 of `b"hello"`.
 const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -331,4 +333,76 @@ fn the_report_marks_an_already_registered_stem_existing() {
     };
     assert_eq!(report.input.origin, AssetOrigin::Registered);
     assert_eq!(report.stems[0].origin, AssetOrigin::Existing);
+}
+
+/// Register `mix.wav` (b"hello") as asset `mix` and write a compare record naming
+/// it, returning the record path relative to the root.
+fn synth_compare(dir: &TempDir, preference: serde_json::Value) -> std::path::PathBuf {
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    add(dir.path(), Path::new("mix.wav"), None, "mix").unwrap();
+    let eval_dir = dir.path().join("evaluations");
+    fs::create_dir_all(&eval_dir).unwrap();
+    let record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "candidates": [{ "label": "A", "asset": "mix" }],
+        "preference": preference,
+        "confidence": "high",
+        "completed_at": "2020-01-03T00:00:00Z",
+    });
+    fs::write(eval_dir.join("cmp.json"), record.to_string()).unwrap();
+    Path::new("evaluations").join("cmp.json")
+}
+
+/// The preference is accepted under `label` as well as `preference` — the compare
+/// contract names it "the record's label" (uncompose#65).
+#[test]
+fn import_accepts_the_preference_under_the_label_key() {
+    let dir = project();
+    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
+    add(dir.path(), Path::new("mix.wav"), None, "mix").unwrap();
+    let eval_dir = dir.path().join("evaluations");
+    fs::create_dir_all(&eval_dir).unwrap();
+    let record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "candidates": [{ "label": "A", "asset": "mix" }],
+        "label": "A",
+        "completed_at": "2020-01-03T00:00:00Z",
+    });
+    fs::write(eval_dir.join("cmp.json"), record.to_string()).unwrap();
+
+    match import(dir.path(), Path::new("evaluations/cmp.json")).unwrap() {
+        ImportOutcome::EvaluationImported(report) => {
+            assert_eq!(report.preference.as_deref(), Some("mix"));
+        }
+        other => panic!("expected EvaluationImported, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_refuses_a_preference_label_that_names_no_candidate() {
+    let dir = project();
+    // The only candidate's label is "A"; the record prefers "Z".
+    let record = synth_compare(&dir, serde_json::Value::from("Z"));
+
+    let err = import(dir.path(), &record).unwrap_err();
+    match err {
+        ImportError::UnknownPreference(label) => assert_eq!(label, "Z"),
+        other => panic!("expected UnknownPreference, got {other:?}"),
+    }
+}
+
+/// Confidence is copied verbatim — a non-numeric confidence (here a string bucket)
+/// is preserved, not coerced or dropped.
+#[test]
+fn import_copies_a_non_numeric_confidence_verbatim() {
+    let dir = project();
+    let record = synth_compare(&dir, serde_json::Value::from("A"));
+
+    match import(dir.path(), &record).unwrap() {
+        ImportOutcome::EvaluationImported(report) => {
+            assert_eq!(report.preference.as_deref(), Some("mix"));
+            assert_eq!(report.confidence, Some(serde_json::Value::from("high")));
+        }
+        other => panic!("expected EvaluationImported, got {other:?}"),
+    }
 }

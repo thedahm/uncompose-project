@@ -32,8 +32,7 @@
     },
     "evaluations": {
       "type": "array",
-      "description": "Reserved. Item shape owned by uncompose#63; empty in v0.",
-      "items": { "type": "object" }
+      "items": { "$ref": "#/$defs/evaluation" }
     },
     "ext": { "$ref": "#/$defs/ext" }
   },
@@ -92,6 +91,40 @@
             "ext": { "$ref": "#/$defs/ext" }
           },
           "description": "Hashed reference to an imported job.json (C2PA hashed-ref pattern). Referenced, never absorbed."
+        },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "required": ["id", "candidates", "preference", "created_at", "record"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/slug" },
+          "description": "Compared asset ids, in the comparison record's candidate order."
+        },
+        "preference": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "The preferred candidate's asset id, or null when the record states no preference."
+        },
+        "confidence": {
+          "description": "Opaque; copied verbatim from the comparison record when present. Type owned by the compare record schema."
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "record": {
+          "type": "object",
+          "required": ["path", "sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "ext": { "$ref": "#/$defs/ext" }
+          },
+          "description": "Hashed reference to an imported comparison record (C2PA hashed-ref pattern). Referenced, never absorbed."
         },
         "ext": { "$ref": "#/$defs/ext" }
       }

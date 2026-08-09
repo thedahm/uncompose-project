@@ -21,3 +21,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0009 — `import`: input resolution by hash, out-of-tree and bad-record refusals](0009-import-hash-resolution-and-out-of-tree-refusals.md)
 - [0010 — `import`: idempotent re-import and per-path asset dedupe](0010-import-idempotency-and-per-path-dedupe.md)
 - [0011 — `--project` everywhere and the flock sidecar](0011-project-flag-and-flock-sidecar.md)
+- [0012 — `import`: dispatch on schema URL and the evaluation entry](0012-import-dispatch-and-evaluation-entry.md)

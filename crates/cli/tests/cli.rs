@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 use uncompose_project_core::{
-    tagline, LOCK_FILENAME, LOCK_WAIT_NOTICE, MANIFEST_FILENAME, SCHEMA_URL,
+    tagline, COMPARE_SCHEMA_URL, LOCK_FILENAME, LOCK_WAIT_NOTICE, MANIFEST_FILENAME, SCHEMA_URL,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_uncompose-project");
@@ -1775,5 +1775,452 @@ fn a_killed_lock_holder_does_not_wedge_the_next_command() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+// --- M5 slice 2: import dispatch on schema URL, evaluation import ---
+
+/// Register two mixes to compare, then write a compare record (uncompose#65) into
+/// `<root>/evaluations/<name>.json` referencing them by asset id. `preference` is
+/// the preferred candidate's label (or `Value::Null` for no preference), mapped
+/// through `candidates` to an asset id. Returns the record path relative to root.
+fn synth_compare(
+    root: &Path,
+    name: &str,
+    a_asset: &str,
+    b_asset: &str,
+    preference: Value,
+    confidence: Option<Value>,
+    completed_at: &str,
+) -> String {
+    let eval_dir = root.join("evaluations");
+    fs::create_dir_all(&eval_dir).unwrap();
+    let mut record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "candidates": [
+            { "label": "A", "asset": a_asset },
+            { "label": "B", "asset": b_asset },
+        ],
+        "preference": preference,
+        "completed_at": completed_at,
+        // An unknown extra the importer must tolerate: the record is evidence.
+        "observations": [{ "loop": 1, "note": "stays in the record file" }],
+    });
+    if let Some(c) = confidence {
+        record["confidence"] = c;
+    }
+    let rel = format!("evaluations/{name}.json");
+    fs::write(root.join(&rel), record.to_string()).unwrap();
+    rel
+}
+
+/// Register `mix-a.wav` and `mix-b.wav` so their auto-minted ids are `mix-a` and
+/// `mix-b`, and return the project.
+fn project_with_two_mixes() -> TempDir {
+    let dir = init_project();
+    fs::write(dir.path().join("mix-a.wav"), b"aaaa").unwrap();
+    fs::write(dir.path().join("mix-b.wav"), b"bbbb").unwrap();
+    assert!(run(dir.path(), &["add", "mix-a.wav"]).status.success());
+    assert!(run(dir.path(), &["add", "mix-b.wav"]).status.success());
+    dir
+}
+
+/// Happy path: a compare record imports as one evaluation whose full content is
+/// correct — candidates in record order, preference mapped label→asset, confidence
+/// copied, created_at from the record, and a hashed record ref.
+#[test]
+fn import_lands_a_compare_record_as_one_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(0.9)),
+        "2020-01-03T00:00:00Z",
+    );
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("evaluation") && stdout.contains("mix-a") && stdout.contains("mix-b"),
+        "summary should name the evaluation and candidates: {stdout}"
+    );
+
+    let manifest = read_manifest(dir.path());
+    // No new assets/derivations — an evaluation only references existing assets.
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 0);
+
+    let evals = manifest["evaluations"].as_array().unwrap();
+    assert_eq!(evals.len(), 1);
+    let e = &evals[0];
+    assert_eq!(e["id"], "mix-a-vs-mix-b");
+    assert_eq!(e["candidates"], serde_json::json!(["mix-a", "mix-b"]));
+    // Preference resolved the label "A" through candidates to the asset id.
+    assert_eq!(e["preference"], "mix-a");
+    assert_eq!(e["confidence"], 0.9);
+    assert_eq!(e["created_at"], "2020-01-03T00:00:00Z");
+    assert_eq!(e["record"]["path"], "evaluations/cmp.json");
+    let sha = e["record"]["sha256"].as_str().unwrap();
+    assert_eq!(sha.len(), 64);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    // The record's observations were not absorbed into the manifest.
+    assert!(
+        !manifest.to_string().contains("stays in the record file"),
+        "the verdict is referenced, not duplicated: {manifest}"
+    );
+
+    assert_valid_against_schema(&manifest);
+}
+
+/// A record with no preference keeps `preference` null in the evaluation, and a
+/// missing confidence is omitted rather than written as null.
+#[test]
+fn import_maps_a_null_preference_to_null_and_omits_missing_confidence() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "tie",
+        "mix-a",
+        "mix-b",
+        Value::Null,
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    let e = &manifest["evaluations"].as_array().unwrap()[0];
+    assert!(e["preference"].is_null(), "null preference stays null: {e}");
+    assert!(
+        e.get("confidence").is_none(),
+        "a missing confidence is omitted, not null: {e}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Regression: a job.json (no `schema` field) still imports as a derivation — the
+/// dispatch leaves the original path byte-for-byte unchanged.
+#[test]
+fn import_still_dispatches_a_schemaless_job_record_to_the_job_path() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    assert!(run(dir.path(), &["import", &job]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["evaluations"].as_array().unwrap().len(), 0);
+}
+
+/// A file whose `schema` is neither absent nor the compare URL refuses, naming the
+/// URL found, and leaves the manifest untouched.
+#[test]
+fn import_refuses_an_unrecognized_schema_url() {
+    let dir = init_project();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let bogus = "https://uncompose.org/schemas/compare/v99/uncompose.compare.schema.json";
+    fs::write(
+        dir.path().join("other.json"),
+        serde_json::json!({ "schema": bogus }).to_string(),
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["import", "other.json"]);
+    assert!(!output.status.success(), "an unknown schema should refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(bogus),
+        "the error should name the schema URL found: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+/// A candidate with no `asset` ref refuses: v0.1 registers project-launched
+/// records only.
+#[test]
+fn import_refuses_a_candidate_without_an_asset_ref() {
+    let dir = project_with_two_mixes();
+    let record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "candidates": [
+            { "label": "A", "asset": "mix-a" },
+            { "label": "B" },
+        ],
+        "preference": "A",
+        "completed_at": "2020-01-03T00:00:00Z",
+    });
+    fs::create_dir_all(dir.path().join("evaluations")).unwrap();
+    fs::write(dir.path().join("evaluations/cmp.json"), record.to_string()).unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", "evaluations/cmp.json"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("asset"),
+        "the error should mention the missing asset ref: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// A candidate referencing an asset id absent from the manifest refuses, naming it.
+#[test]
+fn import_refuses_a_candidate_asset_absent_from_the_manifest() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "ghost",
+        Value::from("A"),
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("ghost"),
+        "the error should name the unknown asset: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// A compare record outside the project root refuses; the manifest is untouched.
+#[test]
+fn import_refuses_a_compare_record_outside_the_project_root() {
+    let dir = project_with_two_mixes();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let outside = dir.path().parent().unwrap().join("uncompose-outside-cmp");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("cmp.json"),
+        serde_json::json!({ "schema": COMPARE_SCHEMA_URL }).to_string(),
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["import", "../uncompose-outside-cmp/cmp.json"]);
+    let _ = fs::remove_dir_all(&outside);
+    assert!(
+        !output.status.success(),
+        "an out-of-root record should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("outside the project root"),
+        "the error should name the confinement: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// Idempotency: re-importing the same compare record (matching sha256) exits 0 as
+/// a stated no-op and leaves the manifest byte-identical.
+#[test]
+fn a_second_import_of_the_same_compare_record_is_a_stated_noop() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(0.9)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+    let after_first = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(
+        output.status.success(),
+        "a re-import must exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.to_lowercase().contains("already") && stdout.contains("mix-a-vs-mix-b"),
+        "the no-op should name the existing evaluation: {stdout}"
+    );
+    assert_eq!(
+        after_first,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// The same record path with different bytes imports as a second evaluation.
+#[test]
+fn a_modified_compare_record_at_the_same_path_imports_a_second_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    // Rewrite the record in place with a different verdict — same path, new bytes.
+    synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("B"),
+        None,
+        "2020-01-04T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    let evals = manifest["evaluations"].as_array().unwrap();
+    assert_eq!(evals.len(), 2, "a differently-hashed record is a new entry");
+    // The disambiguated id keeps the second entry distinct.
+    assert_eq!(evals[0]["id"], "mix-a-vs-mix-b");
+    assert_eq!(evals[1]["id"], "mix-a-vs-mix-b-2");
+    let prefs: Vec<&Value> = evals.iter().map(|e| &e["preference"]).collect();
+    assert!(
+        prefs.contains(&&Value::from("mix-a")) && prefs.contains(&&Value::from("mix-b")),
+        "both verdicts recorded: {prefs:?}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// `show` renders an imported evaluation: id, candidates, preference, confidence,
+/// and the hashed record ref.
+#[test]
+fn show_renders_an_imported_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(0.9)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let show = run(dir.path(), &["show"]);
+    assert!(show.status.success());
+    let stdout = String::from_utf8(show.stdout).unwrap();
+    assert!(stdout.contains("Evaluations (1)"), "{stdout}");
+    assert!(stdout.contains("mix-a-vs-mix-b"), "{stdout}");
+    assert!(
+        stdout.contains("preference") && stdout.contains("mix-a"),
+        "overview should show the preference: {stdout}"
+    );
+    assert!(
+        stdout.contains("confidence") && stdout.contains("0.9"),
+        "overview should show the confidence: {stdout}"
+    );
+    assert!(
+        stdout.contains("evaluations/cmp.json"),
+        "overview should show the record ref path: {stdout}"
+    );
+}
+
+/// `verify` polices an evaluation's record file: a missing record fails the run,
+/// and its path is reported missing.
+#[test]
+fn verify_flags_a_missing_evaluation_record() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+    // A clean project verifies (assets and the record file all present).
+    assert!(run(dir.path(), &["verify"]).status.success());
+
+    fs::remove_file(dir.path().join(&record)).unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "a missing record file should fail verify"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("evaluations/cmp.json") && combined.contains("missing"),
+        "verify should report the record path missing: {combined}"
+    );
+}
+
+/// `verify` flags an evaluation record whose bytes changed after import as
+/// modified.
+#[test]
+fn verify_flags_a_modified_evaluation_record() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    // Tamper with the record file after import.
+    fs::write(dir.path().join(&record), b"{}").unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "a modified record file should fail verify"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("evaluations/cmp.json") && combined.contains("modified"),
+        "verify should report the record path modified: {combined}"
     );
 }
