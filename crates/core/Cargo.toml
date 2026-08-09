@@ -18,6 +18,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 ulid = "1"
 time = { version = "0.3", features = ["formatting"] }
+# flock(2) for the mutating-command sidecar lock (ADR-0011). v0.1 is Linux-only,
+# which is what makes the advisory lock a safe, universal choice.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

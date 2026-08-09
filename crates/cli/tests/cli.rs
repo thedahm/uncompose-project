@@ -5,10 +5,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
-use uncompose_project_core::{tagline, MANIFEST_FILENAME, SCHEMA_URL};
+use uncompose_project_core::{
+    tagline, LOCK_FILENAME, LOCK_WAIT_NOTICE, MANIFEST_FILENAME, SCHEMA_URL,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_uncompose-project");
 
@@ -1097,10 +1100,10 @@ fn import_reuses_a_registered_asset_matching_the_input_hash() {
     assert_valid_against_schema(&manifest);
 }
 
-/// Acceptance: import applies `add`'s path rules, so an absolute job path refuses
-/// even when it lands inside the root; the manifest is left byte-identical.
+/// Acceptance: `import` is the cross-tool handoff target, so an absolute job path
+/// that lands inside the root is accepted (the pinned argv passes absolute paths).
 #[test]
-fn import_refuses_an_absolute_job_path() {
+fn import_accepts_an_absolute_job_path_inside_the_root() {
     let dir = init_project();
     let job = synth_job(
         dir.path(),
@@ -1111,25 +1114,18 @@ fn import_refuses_an_absolute_job_path() {
         &["vocals"],
         "success",
     );
-    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
     let abs = dir.path().join(&job);
 
     let output = run(dir.path(), &["import", abs.to_str().unwrap()]);
     assert!(
-        !output.status.success(),
-        "an absolute job path should refuse"
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("absolute path") && stderr.contains("relative to the project root"),
-        "error should say what to pass instead: {stderr}"
+        output.status.success(),
+        "an absolute in-root job path should import: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
-    assert_eq!(
-        before, after,
-        "a refused import leaves the manifest untouched"
-    );
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
 }
 
 /// Acceptance: a job folder outside the project root refuses; the manifest is
@@ -1547,4 +1543,237 @@ fn verify_refuses_when_the_directory_is_not_a_project() {
     let output = run(dir.path(), &["verify"]);
     assert!(!output.status.success());
     assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+}
+
+// --- M5 slice 1: the `--project` flag everywhere and the flock sidecar ---
+
+/// DoD: the pinned cross-tool argv `import --project <abs-root> <abs-job.json>`
+/// registers a job from any cwd, with both paths absolute.
+#[test]
+fn import_project_flag_works_with_absolute_paths_from_an_unrelated_cwd() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    let job_abs = dir.path().join(&job);
+    // Run from a directory that is not the project and not its parent.
+    let elsewhere = TempDir::new().unwrap();
+
+    let output = Command::new(BIN)
+        .args([
+            "import",
+            "--project",
+            dir.path().to_str().unwrap(),
+            job_abs.to_str().unwrap(),
+        ])
+        .current_dir(elsewhere.path())
+        .output()
+        .expect("failed to run the binary");
+    assert!(
+        output.status.success(),
+        "pinned argv should import from any cwd: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
+}
+
+/// `--project` names the root itself: every command reads exactly
+/// `<dir>/uncompose.project.json` and works from an unrelated cwd.
+#[test]
+fn every_command_honors_project_flag_from_an_unrelated_cwd() {
+    let root = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let at = |args: &[&str]| -> Output {
+        let mut full = vec!["--project", root.path().to_str().unwrap()];
+        full.extend_from_slice(args);
+        Command::new(BIN)
+            .args(&full)
+            .current_dir(elsewhere.path())
+            .output()
+            .expect("failed to run the binary")
+    };
+
+    assert!(at(&["init", "--name", "remote"]).status.success());
+    assert!(root.path().join(MANIFEST_FILENAME).exists());
+    fs::write(root.path().join("song.wav"), b"hello").unwrap();
+    assert!(at(&["add", "song.wav"]).status.success());
+    assert!(at(&["verify"]).status.success());
+    let show = at(&["show"]);
+    assert!(show.status.success());
+    assert!(String::from_utf8(show.stdout).unwrap().contains("remote"));
+}
+
+/// No upward walk: pointing `--project` at a subdirectory of a project refuses,
+/// naming the manifest path it looked for (never the parent's manifest).
+#[test]
+fn project_flag_does_not_walk_up_to_a_parent_manifest() {
+    let dir = init_project();
+    let sub = dir.path().join("nested");
+    fs::create_dir(&sub).unwrap();
+
+    let output = run(&sub, &["show"]);
+    assert!(
+        !output.status.success(),
+        "a subdirectory of a project is not itself a project"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not an uncompose project"),
+        "should refuse as not-a-project: {stderr}"
+    );
+    assert!(
+        stderr.contains(&sub.join(MANIFEST_FILENAME).display().to_string()),
+        "should name the manifest path it expected, not the parent's: {stderr}"
+    );
+}
+
+/// Spawn a background process that acquires the exclusive project lock, signals
+/// readiness by creating `marker`, then holds the lock until it exits. Uses
+/// `flock --no-fork ... exec sleep`, so the single held process can be SIGKILLed
+/// to release the lock (no forked child inherits the locked fd).
+#[cfg(unix)]
+fn spawn_lock_holder(root: &Path, marker: &Path, hold_secs: u32) -> std::process::Child {
+    let lock = root.join(LOCK_FILENAME);
+    Command::new("flock")
+        .arg("--no-fork")
+        .arg(&lock)
+        .arg("sh")
+        .arg("-c")
+        .arg(format!(
+            "touch {}; exec sleep {hold_secs}",
+            marker.display()
+        ))
+        .spawn()
+        .expect("failed to spawn flock lock holder")
+}
+
+/// Wait until `marker` appears — i.e. the holder has the lock — or time out.
+#[cfg(unix)]
+fn wait_for(marker: &Path) {
+    let start = Instant::now();
+    while !marker.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "lock holder never signaled readiness"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A contended mutating command waits for the lock (printing the notice) and then
+/// succeeds once the holder releases it — a blocking wait, never a fail-fast.
+#[cfg(unix)]
+#[test]
+fn a_held_lock_makes_a_mutating_command_wait_then_succeed() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let marker = dir.path().join("holder-ready");
+
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 2);
+    wait_for(&marker);
+
+    // `add` must block on the held lock, print the notice, then succeed.
+    let start = Instant::now();
+    let output = run(dir.path(), &["add", "song.wav"]);
+    let waited = start.elapsed();
+    holder.wait().unwrap();
+
+    assert!(
+        output.status.success(),
+        "add should wait for the lock then succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(LOCK_WAIT_NOTICE),
+        "a contended command should print the waiting notice: {stderr}"
+    );
+    assert!(
+        waited >= Duration::from_millis(500),
+        "add should have blocked until the holder released, waited {waited:?}"
+    );
+    assert_eq!(
+        read_manifest(dir.path())["assets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Two real processes mutating one project concurrently both succeed, and the
+/// manifest ends canonical and complete — neither write is lost (the DoD).
+#[cfg(unix)]
+#[test]
+fn two_concurrent_adds_both_land_without_losing_a_write() {
+    let dir = init_project();
+    fs::write(dir.path().join("a.wav"), b"aaaa").unwrap();
+    fs::write(dir.path().join("b.wav"), b"bbbbb").unwrap();
+
+    let spawn_add = |file: &str| {
+        Command::new(BIN)
+            .args(["add", file])
+            .current_dir(dir.path())
+            .spawn()
+            .expect("failed to spawn add")
+    };
+    // Spawn both before waiting on either, so their read-modify-writes overlap.
+    let mut first = spawn_add("a.wav");
+    let mut second = spawn_add("b.wav");
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    let mut ids: Vec<&str> = assets.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["a", "b"], "both adds must survive; no lost write");
+    // The manifest is canonical (reparses, ends in a trailing newline) and valid.
+    let bytes = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert!(
+        bytes.ends_with("}\n"),
+        "manifest should end canonical: {bytes}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Crash recovery: a killed lock holder releases its advisory lock (kernel
+/// cleanup), so the next mutating command acquires immediately rather than
+/// wedging. If the lock leaked, this `add` would block forever.
+#[cfg(unix)]
+#[test]
+fn a_killed_lock_holder_does_not_wedge_the_next_command() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let marker = dir.path().join("holder-ready");
+
+    // Holder grabs the lock and would hold it for an hour…
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 3600);
+    wait_for(&marker);
+    // …but is killed mid-hold. The kernel releases the advisory lock.
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+    assert!(
+        output.status.success(),
+        "a killed holder must not wedge the next command: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_manifest(dir.path())["assets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

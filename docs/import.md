@@ -13,16 +13,20 @@ terms.
 ## Running it
 
 ```sh
-uncompose-project import path/to/run/job.json   # standalone
-uncompose project import path/to/run/job.json   # via the root CLI — identical behavior
+uncompose-project import path/to/run/job.json                       # standalone, cwd project
+uncompose-project import --project /abs/root /abs/root/run/job.json  # cross-tool, from any cwd
+uncompose project import path/to/run/job.json                       # via the root CLI — identical behavior
 ```
 
-The one argument is the path to a `job.json` written by a completed `uncompose`
-separation. It is relative to your current directory like every other command, and it
-follows the same path rules as `add`: an absolute path is refused (even one that lands
-inside the project), as is anything resolving outside the root. The job folder (the
-directory holding the `job.json`) and every file it names must sit inside the project
-root; import never copies files into the tree.
+Every command takes `--project <dir>` (default `.`), which names the project root
+itself — the manifest must be exactly `<dir>/uncompose.project.json`, with no search of
+parent directories. The one positional argument is the path to a `job.json` written by a
+completed `uncompose` separation, resolved against that root. Because import is the
+cross-tool handoff target, its job argument accepts an **absolute** path as well as a
+relative one, so the pinned argv above works from any directory; either way a path that
+resolves outside the root is refused. The job folder (the directory holding the
+`job.json`) and every file it names must sit inside the project root; import never copies
+files into the tree.
 
 ## What import records
 
@@ -121,7 +125,7 @@ so pipelines can gate on it.
 | --- | --- | --- |
 | **Failed outcome** | The job's `outcome` is not `"success"` (the outcome is shown) | A run that did not complete successfully is never provenance. |
 | **Bad record** | The `job.json` is missing, unreadable, unparsable, or missing a required field (the file and problem are named) | You can tell a bad path from a corrupt record. |
-| **Absolute path** | The job argument, or the record's `input_path`, is absolute — even one landing inside the root | Import applies `add`'s path rules unchanged: paths are relative to the project root, so a project stays portable. |
+| **Absolute `input_path`** | The record's own `input_path` (inside `job.json`) is absolute | A recorded path must stay root-relative and portable; `uncompose-project add` the input so import resolves it by hash. (The job *argument* on the command line may be absolute — see above.) |
 | **Job outside the root** | The `job.json` (and so its job folder) resolves outside the project root | Every recorded path stays root-relative and portable. |
 | **Stem outside the root** | A `<stem>.wav` resolves outside the project root | Same reason: the manifest never references files outside the tree. |
 | **Out-of-tree input** | No registered asset matches by hash **and** the job's `input_path` resolves outside the root | Import never copies files in; it tells you to `uncompose-project add` the input first. |
@@ -129,7 +133,7 @@ so pipelines can gate on it.
 | **Input path conflict** | The input's path is already registered with a different sha256 (both hashes named) | The manifest is never left quietly contradicting the disk. |
 | **Stem path conflict** | A stem's path is already registered with a different sha256 (both hashes named) | Same reason: a drifted file on a registered path is caught loudly. |
 
-From these rules you can predict every case: a failed run, an absolute path, a job or
+From these rules you can predict every case: a failed run, an absolute `input_path`, a job or
 stem outside the root, an input that is neither registered nor in-tree, a file that has
 drifted since the separation, or a path already registered with different bytes each
 refuse with a clear message and no partial write. Everything else — a success whose input resolves by hash or
