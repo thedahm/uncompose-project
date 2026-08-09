@@ -1,15 +1,17 @@
 //! The mutating-command sidecar lock (ADR-0011).
 //!
-//! Every command that rewrites the manifest (`init`, `add`, `import`) serializes
-//! its read-modify-write behind an exclusive advisory `flock` on
-//! `<root>/.uncompose.project.lock`. The lock file is created on first use and
-//! never deleted; the kernel drops the advisory lock when the holder's file
-//! closes (including on a crash), so a dead holder never wedges the next command
-//! and there is no manual cleanup or recovery step.
+//! Every rewrite of the manifest — `init`, `add`, `import`, and `verify`'s
+//! `last_verified` stamp — serializes its read-modify-write behind an exclusive
+//! advisory `flock` on `<root>/.uncompose.project.lock`. The lock file is created
+//! on first use and never deleted; the kernel drops the advisory lock when the
+//! holder's file closes (including on a crash), so a dead holder never wedges the
+//! next command and there is no manual cleanup or recovery step.
 //!
-//! Readers (`show`, `verify`) take no lock — the canonical temp+rename write
-//! (ADR-0002) hands every reader a consistent snapshot. v0.1 is Linux-only, which
-//! is what makes `flock` a safe, universal choice (per the roadmap).
+//! Reading takes no lock — the canonical temp+rename write (ADR-0002) hands every
+//! reader a consistent snapshot — and neither does expensive work: `verify` hashes
+//! every asset before it asks for the lock, and takes it only to stamp what
+//! passed. v0.1 is Linux-only, which is what makes `flock` a safe, universal
+//! choice (per the roadmap).
 
 use std::fs::{File, OpenOptions};
 use std::io;

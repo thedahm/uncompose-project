@@ -335,44 +335,55 @@ fn the_report_marks_an_already_registered_stem_existing() {
     assert_eq!(report.stems[0].origin, AssetOrigin::Existing);
 }
 
-/// Register `mix.wav` (b"hello") as asset `mix` and write a compare record naming
-/// it, returning the record path relative to the root.
-fn synth_compare(dir: &TempDir, preference: serde_json::Value) -> std::path::PathBuf {
-    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
-    add(dir.path(), Path::new("mix.wav"), None, "mix").unwrap();
+/// Register `mix-a.wav`/`mix-b.wav` as assets `mix-a`/`mix-b` and write a compare
+/// record (uncompose#65) comparing them, returning the record path relative to the
+/// root. `result` is the record's verdict object verbatim, so a test can hand it a
+/// well-formed or a deliberately off-shape one; everything else is a conforming v0
+/// record as `uncompose-compare` writes it.
+fn synth_compare(dir: &TempDir, result: serde_json::Value) -> std::path::PathBuf {
+    for (file, id) in [("mix-a.wav", "mix-a"), ("mix-b.wav", "mix-b")] {
+        fs::write(dir.path().join(file), id.as_bytes()).unwrap();
+        add(dir.path(), Path::new(file), None, "mix").unwrap();
+    }
     let eval_dir = dir.path().join("evaluations");
     fs::create_dir_all(&eval_dir).unwrap();
     let record = serde_json::json!({
         "schema": COMPARE_SCHEMA_URL,
-        "candidates": [{ "label": "A", "asset": "mix" }],
-        "preference": preference,
-        "confidence": "high",
-        "completed_at": "2020-01-03T00:00:00Z",
+        "id": "01J4QF8ZK3M2X7W9C5V1B6N4TQ",
+        "created_at": "2020-01-03T00:00:00Z",
+        "completed_at": "2020-01-03T00:10:00Z",
+        "candidates": [
+            { "label": "A", "path": "mix-a.wav", "sha256": A_SHA256, "size": 5, "asset": "mix-a" },
+            { "label": "B", "path": "mix-b.wav", "sha256": B_SHA256, "size": 5, "asset": "mix-b" },
+        ],
+        "mode": "ab-blind",
+        "playback": { "loudness_match": { "enabled": false } },
+        "observations": [],
+        "result": result,
     });
     fs::write(eval_dir.join("cmp.json"), record.to_string()).unwrap();
     Path::new("evaluations").join("cmp.json")
 }
 
-/// The preference is accepted under `label` as well as `preference` — the compare
-/// contract names it "the record's label" (uncompose#65).
-#[test]
-fn import_accepts_the_preference_under_the_label_key() {
-    let dir = project();
-    fs::write(dir.path().join("mix.wav"), b"hello").unwrap();
-    add(dir.path(), Path::new("mix.wav"), None, "mix").unwrap();
-    let eval_dir = dir.path().join("evaluations");
-    fs::create_dir_all(&eval_dir).unwrap();
-    let record = serde_json::json!({
-        "schema": COMPARE_SCHEMA_URL,
-        "candidates": [{ "label": "A", "asset": "mix" }],
-        "label": "A",
-        "completed_at": "2020-01-03T00:00:00Z",
-    });
-    fs::write(eval_dir.join("cmp.json"), record.to_string()).unwrap();
+/// sha256 of `b"mix-a"` / `b"mix-b"` — the candidate identities a real record
+/// carries alongside the asset refs.
+const A_SHA256: &str = "4cf51cd1f675a1e1168e59a9830efe719fdb1b9cfb230068261dbe41ae5376f7";
+const B_SHA256: &str = "b74dcd1fa8e5a54389f7b48782b2477a1174714dc8fb143382a415040ab8da3f";
 
-    match import(dir.path(), Path::new("evaluations/cmp.json")).unwrap() {
+/// The verdict lives in `result` (uncompose#65): a preference there maps through
+/// the record's candidates to an asset id, and the confidence beside it is copied.
+#[test]
+fn import_reads_the_verdict_from_the_records_result_object() {
+    let dir = project();
+    let record = synth_compare(
+        &dir,
+        serde_json::json!({ "preference": "B", "confidence": 4 }),
+    );
+
+    match import(dir.path(), &record).unwrap() {
         ImportOutcome::EvaluationImported(report) => {
-            assert_eq!(report.preference.as_deref(), Some("mix"));
+            assert_eq!(report.preference.as_deref(), Some("mix-b"));
+            assert_eq!(report.confidence, Some(serde_json::Value::from(4)));
         }
         other => panic!("expected EvaluationImported, got {other:?}"),
     }
@@ -381,8 +392,11 @@ fn import_accepts_the_preference_under_the_label_key() {
 #[test]
 fn import_refuses_a_preference_label_that_names_no_candidate() {
     let dir = project();
-    // The only candidate's label is "A"; the record prefers "Z".
-    let record = synth_compare(&dir, serde_json::Value::from("Z"));
+    // The candidates are labelled "A" and "B"; the record prefers "Z".
+    let record = synth_compare(
+        &dir,
+        serde_json::json!({ "preference": "Z", "confidence": 3 }),
+    );
 
     let err = import(dir.path(), &record).unwrap_err();
     match err {
@@ -391,18 +405,43 @@ fn import_refuses_a_preference_label_that_names_no_candidate() {
     }
 }
 
-/// Confidence is copied verbatim — a non-numeric confidence (here a string bucket)
-/// is preserved, not coerced or dropped.
+/// A record that does not conform to compare v0 refuses, naming the violation —
+/// here a confidence outside the schema's 1–5 range. The record is evidence from
+/// another tool, so its own published schema is the contract it is held to.
 #[test]
-fn import_copies_a_non_numeric_confidence_verbatim() {
+fn import_refuses_a_record_that_violates_the_compare_schema() {
     let dir = project();
-    let record = synth_compare(&dir, serde_json::Value::from("A"));
+    let record = synth_compare(
+        &dir,
+        serde_json::json!({ "preference": "A", "confidence": 9 }),
+    );
 
-    match import(dir.path(), &record).unwrap() {
-        ImportOutcome::EvaluationImported(report) => {
-            assert_eq!(report.preference.as_deref(), Some("mix"));
-            assert_eq!(report.confidence, Some(serde_json::Value::from("high")));
+    match import(dir.path(), &record).unwrap_err() {
+        ImportError::RecordNotConforming(path, detail) => {
+            assert!(path.ends_with("cmp.json"), "names the record: {path:?}");
+            assert!(detail.contains('9'), "names the violation: {detail}");
         }
-        other => panic!("expected EvaluationImported, got {other:?}"),
+        other => panic!("expected RecordNotConforming, got {other:?}"),
+    }
+}
+
+/// The verdict's shape is the schema's, not a shape this tool invented: a
+/// top-level `preference` (never written by `uncompose-compare`) is an unknown
+/// property, and the missing `result` is a missing required one. Either way the
+/// record refuses rather than importing as a silent "no preference".
+#[test]
+fn import_refuses_a_record_with_the_preference_outside_result() {
+    let dir = project();
+    let record = synth_compare(&dir, serde_json::json!({ "preference": null }));
+    let path = dir.path().join(&record);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["preference"] = serde_json::Value::from("A");
+    value.as_object_mut().unwrap().remove("result");
+    fs::write(&path, value.to_string()).unwrap();
+
+    match import(dir.path(), &record).unwrap_err() {
+        ImportError::RecordNotConforming(..) => {}
+        other => panic!("expected RecordNotConforming, got {other:?}"),
     }
 }

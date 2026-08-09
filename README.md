@@ -36,9 +36,10 @@ and why, and how re-import stays idempotent.
 
 Every command takes `--project <dir>` (default `.`) to name the project root explicitly,
 so you can operate on a project from any directory; it names the root itself, with no
-search of parent directories. Each mutating command (`init`, `add`, `import`) serializes
-its write behind an advisory lock at `<root>/.uncompose.project.lock`, so concurrent
-writers wait rather than corrupt or lose a write.
+search of parent directories. Every manifest write — `init`, `add`, `import`, and the
+`last_verified` stamp `verify` leaves on assets that pass — serializes behind an advisory
+lock at `<root>/.uncompose.project.lock`, so concurrent writers wait rather than corrupt
+or lose a write. Reading and hashing take no lock.
 
 ## Responsible use
 

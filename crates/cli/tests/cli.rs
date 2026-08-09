@@ -473,6 +473,33 @@ fn show_refuses_a_derivation_with_an_unknown_field() {
     );
 }
 
+/// `preference` is required on an evaluation (the schema lists it, and `null` is
+/// the meaningful "no preference" verdict), so a manifest missing the key is
+/// off-shape rather than parsing and silently gaining a null on the next rewrite.
+#[test]
+fn show_refuses_an_evaluation_missing_its_preference() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": [\n    {{\n      \"id\": \"a-vs-b\",\n      \"candidates\": [\"a\", \"b\"],\n      \"created_at\": \"2020-01-02T00:00:00Z\",\n      \"record\": {{ \"path\": \"evaluations/cmp.json\", \"sha256\": \"{ZERO_SHA256}\" }}\n    }}\n  ]\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(
+        !output.status.success(),
+        "an evaluation without `preference` should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("preference"),
+        "error should name the missing field: {stderr}"
+    );
+}
+
+/// A syntactically valid sha256 for hand-written manifest fixtures.
+const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// A derivation missing a required field (here `tool`) is off-shape, not
 /// best-effort-rendered.
 #[test]
@@ -1778,12 +1805,84 @@ fn a_killed_lock_holder_does_not_wedge_the_next_command() {
     );
 }
 
+/// `verify`'s `last_verified` refresh is a read-modify-write like any other, so a
+/// mutator that commits *during* the hash pass must survive it. The hash pass runs
+/// off a snapshot taken before it; writing that snapshot back would erase whatever
+/// landed meanwhile — a lost asset, not just a lost timestamp.
+#[cfg(unix)]
+#[test]
+fn verify_does_not_clobber_a_write_committed_during_its_hash_pass() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+    let marker = dir.path().join("holder-ready");
+
+    // A holder pins the lock, so `verify` gets through its whole hash pass and then
+    // blocks at the stamp write — the exact window a concurrent mutator commits in.
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 2);
+    wait_for(&marker);
+    let mut verify = Command::new(BIN)
+        .arg("verify")
+        .current_dir(dir.path())
+        .spawn()
+        .expect("failed to spawn verify");
+
+    // Stand in for that mutator: `verify`'s snapshot is already read, and this
+    // write lands before it can take the lock.
+    std::thread::sleep(Duration::from_millis(300));
+    let mut manifest = read_manifest(dir.path());
+    manifest["assets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "late",
+            "path": "late.wav",
+            "sha256": ZERO_SHA256,
+            "size": 4,
+            "role": "mix",
+            "added_at": "2020-01-02T00:00:00Z",
+        }));
+    fs::write(
+        dir.path().join(MANIFEST_FILENAME),
+        format!("{manifest:#}\n"),
+    )
+    .unwrap();
+
+    holder.wait().unwrap();
+    assert!(verify.wait().unwrap().success());
+
+    let after = read_manifest(dir.path());
+    let ids: Vec<&str> = after["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"late"),
+        "the concurrent write must survive verify's stamp: {ids:?}"
+    );
+    // And the stamp itself still landed on what verify actually verified.
+    let song = after["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "song")
+        .unwrap();
+    assert!(
+        song["last_verified"].is_string(),
+        "the verified asset should still be stamped: {song}"
+    );
+}
+
 // --- M5 slice 2: import dispatch on schema URL, evaluation import ---
 
-/// Register two mixes to compare, then write a compare record (uncompose#65) into
-/// `<root>/evaluations/<name>.json` referencing them by asset id. `preference` is
-/// the preferred candidate's label (or `Value::Null` for no preference), mapped
-/// through `candidates` to an asset id. Returns the record path relative to root.
+/// Register two mixes to compare, then write a conforming compare v0 record
+/// (uncompose#65) into `<root>/evaluations/<name>.json` referencing them by asset
+/// id. `preference` is the preferred candidate's label (or `Value::Null` for no
+/// preference), which import maps through `candidates` to an asset id; the schema
+/// requires a 1–5 `confidence` beside a non-null preference and forbids one beside
+/// a null preference. Returns the record path relative to root.
 fn synth_compare(
     root: &Path,
     name: &str,
@@ -1795,24 +1894,36 @@ fn synth_compare(
 ) -> String {
     let eval_dir = root.join("evaluations");
     fs::create_dir_all(&eval_dir).unwrap();
-    let mut record = serde_json::json!({
-        "schema": COMPARE_SCHEMA_URL,
-        "candidates": [
-            { "label": "A", "asset": a_asset },
-            { "label": "B", "asset": b_asset },
-        ],
-        "preference": preference,
-        "completed_at": completed_at,
-        // An unknown extra the importer must tolerate: the record is evidence.
-        "observations": [{ "loop": 1, "note": "stays in the record file" }],
-    });
+    let mut result = serde_json::json!({ "preference": preference });
     if let Some(c) = confidence {
-        record["confidence"] = c;
+        result["confidence"] = c;
     }
+    let record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "id": "01J4QF8ZK3M2X7W9C5V1B6N4TQ",
+        "created_at": "2020-01-02T00:00:00Z",
+        "completed_at": completed_at,
+        "candidates": [
+            { "label": "A", "path": "mix-a.wav", "sha256": A_SHA256, "size": 4, "asset": a_asset },
+            { "label": "B", "path": "mix-b.wav", "sha256": B_SHA256, "size": 4, "asset": b_asset },
+        ],
+        "mode": "ab-blind",
+        "playback": { "loudness_match": { "enabled": false } },
+        // The body the manifest must reference rather than absorb.
+        "observations": [
+            { "at": "2020-01-02T00:05:00Z", "text": "stays in the record file" },
+        ],
+        "result": result,
+    });
     let rel = format!("evaluations/{name}.json");
     fs::write(root.join(&rel), record.to_string()).unwrap();
     rel
 }
+
+/// sha256 of `b"aaaa"` / `b"bbbb"` — the two mixes `project_with_two_mixes`
+/// registers, as a real record carries them alongside the asset refs.
+const A_SHA256: &str = "61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4";
+const B_SHA256: &str = "81cc5b17018674b401b42f35ba07bb79e211239c23bffe658da1577e3e646877";
 
 /// Register `mix-a.wav` and `mix-b.wav` so their auto-minted ids are `mix-a` and
 /// `mix-b`, and return the project.
@@ -1837,7 +1948,7 @@ fn import_lands_a_compare_record_as_one_evaluation() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        Some(Value::from(0.9)),
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
 
@@ -1853,6 +1964,10 @@ fn import_lands_a_compare_record_as_one_evaluation() {
         stdout.contains("evaluation") && stdout.contains("mix-a") && stdout.contains("mix-b"),
         "summary should name the evaluation and candidates: {stdout}"
     );
+    assert!(
+        stdout.contains("record:") && stdout.contains("evaluations/cmp.json"),
+        "summary should name the hashed record the entry now points at: {stdout}"
+    );
 
     let manifest = read_manifest(dir.path());
     // No new assets/derivations — an evaluation only references existing assets.
@@ -1866,7 +1981,7 @@ fn import_lands_a_compare_record_as_one_evaluation() {
     assert_eq!(e["candidates"], serde_json::json!(["mix-a", "mix-b"]));
     // Preference resolved the label "A" through candidates to the asset id.
     assert_eq!(e["preference"], "mix-a");
-    assert_eq!(e["confidence"], 0.9);
+    assert_eq!(e["confidence"], 4);
     assert_eq!(e["created_at"], "2020-01-03T00:00:00Z");
     assert_eq!(e["record"]["path"], "evaluations/cmp.json");
     let sha = e["record"]["sha256"].as_str().unwrap();
@@ -1959,17 +2074,25 @@ fn import_refuses_an_unrecognized_schema_url() {
 #[test]
 fn import_refuses_a_candidate_without_an_asset_ref() {
     let dir = project_with_two_mixes();
-    let record = serde_json::json!({
-        "schema": COMPARE_SCHEMA_URL,
-        "candidates": [
-            { "label": "A", "asset": "mix-a" },
-            { "label": "B" },
-        ],
-        "preference": "A",
-        "completed_at": "2020-01-03T00:00:00Z",
-    });
-    fs::create_dir_all(dir.path().join("evaluations")).unwrap();
-    fs::write(dir.path().join("evaluations/cmp.json"), record.to_string()).unwrap();
+    // A conforming record in every other respect — `asset` is optional in compare
+    // v0 (a standalone session writes none), so this refusal is the project's, not
+    // the schema's.
+    let rel = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    let path = dir.path().join(&rel);
+    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    record["candidates"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("asset");
+    fs::write(&path, record.to_string()).unwrap();
     let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
 
     let output = run(dir.path(), &["import", "evaluations/cmp.json"]);
@@ -1995,7 +2118,7 @@ fn import_refuses_a_candidate_asset_absent_from_the_manifest() {
         "mix-a",
         "ghost",
         Value::from("A"),
-        None,
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
@@ -2055,7 +2178,7 @@ fn a_second_import_of_the_same_compare_record_is_a_stated_noop() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        Some(Value::from(0.9)),
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());
@@ -2088,7 +2211,7 @@ fn a_modified_compare_record_at_the_same_path_imports_a_second_evaluation() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        None,
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());
@@ -2100,7 +2223,7 @@ fn a_modified_compare_record_at_the_same_path_imports_a_second_evaluation() {
         "mix-a",
         "mix-b",
         Value::from("B"),
-        None,
+        Some(Value::from(5)),
         "2020-01-04T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());
@@ -2130,7 +2253,7 @@ fn show_renders_an_imported_evaluation() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        Some(Value::from(0.9)),
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());
@@ -2145,7 +2268,7 @@ fn show_renders_an_imported_evaluation() {
         "overview should show the preference: {stdout}"
     );
     assert!(
-        stdout.contains("confidence") && stdout.contains("0.9"),
+        stdout.contains("confidence: 4"),
         "overview should show the confidence: {stdout}"
     );
     assert!(
@@ -2165,7 +2288,7 @@ fn verify_flags_a_missing_evaluation_record() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        None,
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());
@@ -2201,7 +2324,7 @@ fn verify_flags_a_modified_evaluation_record() {
         "mix-a",
         "mix-b",
         Value::from("A"),
-        None,
+        Some(Value::from(4)),
         "2020-01-03T00:00:00Z",
     );
     assert!(run(dir.path(), &["import", &record]).status.success());

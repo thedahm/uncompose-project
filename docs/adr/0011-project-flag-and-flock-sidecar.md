@@ -44,9 +44,10 @@ Compare handover) could build on this repo:
   (inside `job.json`) also keeps its absolute-path refusal — that is job content,
   not the cross-tool argv.
 
-- **A flock sidecar serializes mutation.** Every mutating command (`init`, `add`,
-  `import`) wraps its read-modify-write in an exclusive advisory `flock(2)` on
-  `<root>/.uncompose.project.lock` (created on first use, never deleted):
+- **A flock sidecar serializes mutation.** Every read-modify-write of the manifest
+  — `init`, `add`, `import`, and `verify`'s `last_verified` stamp — runs inside an
+  exclusive advisory `flock(2)` on `<root>/.uncompose.project.lock` (created on
+  first use, never deleted):
 
   - **Blocking wait, not fail-fast.** Acquisition tries once without blocking; if
     another holder has the lock, the command prints `waiting for project lock…`
@@ -64,17 +65,28 @@ Compare handover) could build on this repo:
     open file description; the kernel drops it when the holder's file closes,
     including on a crash. No manual cleanup, no recovery command, no stale-lock
     detection.
-  - **Readers take no lock.** `show` and `verify` (and any external direct
-    manifest read) take no lock; the canonical atomic write hands every reader a
-    consistent snapshot. `verify`'s `last_verified` refresh is a best-effort
-    cache, so it is treated as a reader — a rewrite it loses to a concurrent
-    mutator only drops a timestamp, never an asset.
+  - **Readers take no lock; `verify`'s stamp write is not a read.** `show` and
+    `verify` (and any external direct manifest read) hash and render without a
+    lock; the canonical atomic write hands every reader a consistent snapshot.
+    But `verify` does not only read: when an asset passes it refreshes that
+    asset's `last_verified`, and a rewrite is a rewrite. The stamp is therefore
+    taken like any other mutation — lock, re-read, write — while the expensive
+    part, the hash pass over every asset, stays outside it. Treating the stamp as
+    a reader would have been a lost-update bug, not a lost timestamp: the
+    snapshot the hash pass runs on is stale by exactly as long as hashing takes,
+    so writing it back would erase an `add`/`import` that committed in between.
+    Only assets still carrying the sha256 they were verified against are stamped;
+    one a mutator re-registered mid-pass was verified against bytes the manifest
+    no longer claims.
 
 - **Linux-only, so `flock` is safe.** v0.1 targets Linux (per the roadmap), where
   `flock` is universally available and well-behaved. The lock lives in the core
-  crate (`crate::lock`) so all three mutating ops share one implementation; the
+  crate (`crate::lock`) so every mutating op shares one implementation; the
   contention notice is emitted from there via the shared `LOCK_WAIT_NOTICE`
-  constant, the one place the CLI's read path (`show`/`verify`) never reaches.
+  constant. That keeps one notice with one wording next to the wait it describes,
+  at the cost of the core writing a line to stderr — the one place it does. A
+  contended `verify` can now print it too, which is honest: it is waiting for the
+  same reason a contended `add` is.
 
 ## Consequences
 
@@ -89,4 +101,10 @@ Compare handover) could build on this repo:
 - `import` still holds the lock across one small, often-skipped input hash (the
   hash-first input resolution is interleaved with manifest state); moving that
   final hash out of the critical section is a possible future refinement, not a
-  correctness gap.
+  correctness gap. Hashing it unconditionally before the lock is *not* that
+  refinement: an input already registered under another name need not still exist
+  at the path the job recorded, so the eager hash would turn imports that work
+  today into `input file not found`.
+- `verify` now creates the lock file (on a project where no mutation has happened
+  yet) and can block behind a mutator. It still never blocks anyone during its
+  hash pass, which is the long part; only the stamp write is serialized.

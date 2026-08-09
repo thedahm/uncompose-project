@@ -21,6 +21,13 @@ time = { version = "0.3", features = ["formatting"] }
 # flock(2) for the mutating-command sidecar lock (ADR-0011). v0.1 is Linux-only,
 # which is what makes the advisory lock a safe, universal choice.
 libc = "0.2"
+# Validates imported comparison records against the vendored compare v0 schema
+# (ADR-0012) — the same crate, and the same schema bytes, `uncompose-compare`
+# validates with when it writes the record.
+# default-features off drops the HTTP/file `$ref` resolvers (and reqwest/tokio with
+# them): the schema is embedded and self-contained, and a local-first tool has no
+# business fetching a schema over the network mid-import.
+jsonschema = { version = "0.26", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

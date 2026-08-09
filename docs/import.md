@@ -165,14 +165,23 @@ file; the manifest keeps only what it needs to describe the verdict.
 uncompose-project import evaluations/vocals.compare.json
 ```
 
+Unlike a `job.json`, a comparison record is checked against a published schema:
+`uncompose-compare` owns the compare v0 schema, this repo keeps a pinned copy of it
+(`schemas/vendor/compare/v0/`), and every record is validated whole before import reads
+anything out of it. That is the same schema, and the same bytes, Compare validates
+against when it writes the record — so a record one tool accepts, the other accepts.
+Validating is not absorbing: the record's body still stays in the file behind the ref.
+
 From a compare record, import appends an evaluation with:
 
 - **`candidates`** — the compared asset ids, in the record's candidate order.
-- **`preference`** — the preferred candidate's asset id. The record names its preference
-  by a candidate **label**; import maps that label through the record's own candidates to
-  an asset id. A record that states no preference keeps `preference` **null**.
-- **`confidence`** — copied verbatim when the record carries one (the compare schema owns
-  its type), omitted otherwise.
+- **`preference`** — the preferred candidate's asset id, from the record's
+  `result.preference`. The record names its preference by a candidate **label**; import
+  maps that label through the record's own candidates to an asset id. A record that
+  states no preference keeps `preference` **null**.
+- **`confidence`** — the record's `result.confidence`, copied verbatim when it carries
+  one (compare v0 makes it an integer 1–5, present exactly when there is a preference),
+  omitted otherwise.
 - **`created_at`** — the record's `completed_at`.
 - **`record`** — the hashed `{path, sha256}` reference to the comparison file.
 - **`id`** — minted from the candidate asset ids as `<a>-vs-<b>`, disambiguated with a
@@ -188,7 +197,8 @@ same path rewritten with a different verdict imports as a second evaluation.
 | Refusal | When | Why |
 | --- | --- | --- |
 | **Unrecognized schema** | The file's `schema` is neither absent (a job record) nor the compare v0 URL (the URL is shown) | One verb imports known evidence only; an unknown format is never guessed at. |
-| **Candidate without an asset** | A candidate has no `asset` reference | v0.1 registers project-launched records only — every candidate must be an asset in this project. |
+| **Non-conforming record** | The file claims compare v0 but does not validate against it (the first violation is named) | A record that Compare itself would not have written is not evidence; guessing at its shape would record a verdict it never stated. |
+| **Candidate without an asset** | A candidate has no `asset` reference | `asset` is optional in compare v0 (a standalone session writes none), but v0.1 registers project-launched records only — every candidate must be an asset in this project. |
 | **Unknown asset** | A candidate references an asset id not registered here (the id is named) | The verdict links to assets the project already protects, never dangling ids; `uncompose-project add` it first. |
 | **Unknown preference** | The record prefers a candidate label that is not among its candidates | A preference that cannot be resolved to an asset would be a silently wrong verdict. |
 | **Record outside the root** | The comparison file resolves outside the project root | Every recorded path stays root-relative and portable; import never copies files in. |

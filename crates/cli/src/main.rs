@@ -252,7 +252,12 @@ fn run_import(root: &Path, job: PathBuf) -> ExitCode {
                     None => println!("  confidence: {confidence}"),
                 }
             }
-            println!("  evaluation: {}", report.evaluation_id);
+            // The record ref closes the summary the way the job arm's `derivation:`
+            // does: the thing the entry now points at, which the header did not say.
+            println!(
+                "  record:     {} (sha256 {})",
+                report.record_path, report.record_sha256
+            );
             ExitCode::SUCCESS
         }
         Ok(ImportOutcome::EvaluationAlreadyImported { evaluation_id }) => {
