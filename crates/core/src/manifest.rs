@@ -24,7 +24,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::lock::{ProjectLock, LOCK_WAIT_NOTICE};
+use crate::lock::ProjectLock;
 use crate::MANIFEST_FILENAME;
 
 /// The absolute schema URL v0 manifests carry, compared by exact string match
@@ -193,8 +193,7 @@ pub fn init(root: &Path, name: &str) -> Result<PathBuf, InitError> {
     // exists-check and the create happen under the exclusive project lock, so two
     // `init`s can never both decide the manifest is absent. The lock file is
     // created here beside the manifest (ADR-0011).
-    let _lock =
-        ProjectLock::acquire(root, || eprintln!("{LOCK_WAIT_NOTICE}")).map_err(InitError::Io)?;
+    let _lock = ProjectLock::acquire(root).map_err(InitError::Io)?;
     if manifest_path.exists() {
         return Err(InitError::AlreadyExists(manifest_path));
     }
@@ -358,8 +357,7 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     // add's assets are visible), re-check duplicates and mint the id against that
     // authoritative snapshot, then write. Two concurrent adds thus serialize and
     // neither loses the other's write.
-    let _lock =
-        ProjectLock::acquire(root, || eprintln!("{LOCK_WAIT_NOTICE}")).map_err(AddError::Io)?;
+    let _lock = ProjectLock::acquire(root).map_err(AddError::Io)?;
     let (_, mut manifest) = load_manifest(root)?;
 
     if let Some(existing) = manifest.assets.iter().find(|a| a.path == stored_path) {
@@ -616,19 +614,20 @@ impl From<LoadError> for ImportError {
     }
 }
 
-/// Import a completed `uncompose` job at `job_arg` (relative to `root`): register
-/// its input as a `mix` asset, each stem as a `stem` asset, and one derivation
-/// recording the separation with a hashed reference to the `job.json`. The
-/// `job.json` itself is referenced, never registered as an asset.
+/// Import a completed `uncompose` job at `job_arg` (relative to `root`, or an
+/// absolute path resolving inside it): register its input as a `mix` asset, each
+/// stem as a `stem` asset, and one derivation recording the separation with a
+/// hashed reference to the `job.json`. The `job.json` itself is referenced,
+/// never registered as an asset.
 ///
 /// A `job.json` whose sha256 a derivation already records is a stated no-op:
 /// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
 /// is written. Otherwise refuses — leaving the manifest byte-identical — when the
 /// job record is missing/unreadable/malformed, its `outcome` is not success, the
-/// input's current bytes do not match the recorded `input_sha256`, the job
-/// argument or the record's `input_path` is absolute, any referenced file resolves
-/// outside the project root, or a referenced path is already registered with a
-/// conflicting hash. Writes the updated manifest once, atomically.
+/// input's current bytes do not match the recorded `input_sha256`, the record's
+/// `input_path` is absolute, any referenced file resolves outside the project
+/// root, or a referenced path is already registered with a conflicting hash.
+/// Writes the updated manifest once, atomically.
 pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError> {
     let manifest_path = root.join(MANIFEST_FILENAME);
 
@@ -708,8 +707,7 @@ pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError>
     // --- Under the exclusive project lock: the read-modify-write. The manifest is
     // read fresh so a concurrent mutator's assets/derivations are visible, and the
     // whole decide-and-write runs atomically against other mutators.
-    let _lock =
-        ProjectLock::acquire(root, || eprintln!("{LOCK_WAIT_NOTICE}")).map_err(ImportError::Io)?;
+    let _lock = ProjectLock::acquire(root).map_err(ImportError::Io)?;
     let (_, mut manifest) = load_manifest(root)?;
 
     // Idempotency (uncompose#63): any existing derivation whose `job.sha256` equals

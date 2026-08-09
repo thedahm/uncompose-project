@@ -19,7 +19,7 @@ use std::path::Path;
 use crate::LOCK_FILENAME;
 
 /// The stderr notice shown once when the project lock is contended, before the
-/// blocking wait. Exposed so the CLI and its tests share one exact wording.
+/// blocking wait. Exposed so the CLI's tests assert the exact wording.
 pub const LOCK_WAIT_NOTICE: &str = "waiting for project lock…";
 
 /// A held exclusive lock on the project. Released when dropped: the file closes
@@ -34,10 +34,10 @@ pub struct ProjectLock {
 impl ProjectLock {
     /// Acquire the exclusive project lock at `<root>/.uncompose.project.lock`,
     /// creating the lock file if absent. Tries once without blocking; if another
-    /// holder has it, `on_contended` fires once and this then blocks until the
-    /// lock is free — a wait, never a failure, so a contended command queues
-    /// behind the holder rather than erroring.
-    pub fn acquire(root: &Path, on_contended: impl FnOnce()) -> io::Result<ProjectLock> {
+    /// holder has it, prints [`LOCK_WAIT_NOTICE`] to stderr once and then blocks
+    /// until the lock is free — a wait, never a failure, so a contended command
+    /// queues behind the holder rather than erroring.
+    pub fn acquire(root: &Path) -> io::Result<ProjectLock> {
         let path = root.join(LOCK_FILENAME);
         let file = OpenOptions::new()
             .read(true)
@@ -50,7 +50,7 @@ impl ProjectLock {
         match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                on_contended();
+                eprintln!("{LOCK_WAIT_NOTICE}");
                 flock(&file, libc::LOCK_EX)?;
             }
             Err(e) => return Err(e),

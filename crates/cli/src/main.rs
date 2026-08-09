@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize the current directory as an uncompose project.
+    /// Initialize the project directory as an uncompose project.
     Init {
         /// Project name (defaults to the directory name).
         #[arg(long)]
@@ -48,7 +48,8 @@ enum Command {
     /// Import a completed uncompose job: register its input, stems, and the
     /// derivation that ties them together.
     Import {
-        /// Path to the job's `job.json`, relative to the project root.
+        /// Path to the job's `job.json`: relative to the project root, or an
+        /// absolute path that resolves inside it.
         job: PathBuf,
     },
     /// Check that each registered file still matches its recorded identity.
