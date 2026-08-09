@@ -26,8 +26,11 @@ holds derivations and `show` displays them, but no M1 command creates one (impor
 _Avoid_: transform, edge, link
 
 **Evaluation**:
-A reserved kind for future quality/comparison records. `evaluations` is an empty array in
-v0; its item shape is owned by uncompose#63 and lands post-M1.
+A recorded comparison verdict over assets — shape
+`{id, candidates[], preference, confidence?, created_at, record}`. `import` writes one from
+a compare record (uncompose#65): `candidates` are the compared asset ids, `preference` the
+preferred asset id (or null), and `record` a hashed `{path, sha256}` reference to the
+comparison file, which stays behind the ref rather than being absorbed.
 _Avoid_: result, score, report
 
 **Integrity state**:

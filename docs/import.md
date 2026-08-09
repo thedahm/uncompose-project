@@ -1,10 +1,23 @@
-# Importing a job: the imported graph
+# Importing evidence: the imported graph
 
-`import` reads a completed `uncompose` job record and lands the whole separation in
-your [manifest](../CONTEXT.md#language) in one step: the source **asset** it derived
-from, each output stem as an asset, and one **derivation** tying them together with a
-hashed reference to the `job.json` as evidence. After import, `verify` protects the
-stems and the source like any other asset, and `show` renders the relationship.
+`import` reads an **evidence file** from another tool and lands what it describes in
+your [manifest](../CONTEXT.md#language) in one step. It is one verb over two kinds of
+evidence, chosen by the file's top-level `schema` field:
+
+- a completed `uncompose` **job record** (`job.json`, no `schema` field) → a
+  **derivation** with its source and stems;
+- a **comparison record** from `uncompose-compare`
+  (`schema: https://uncompose.org/schemas/compare/v0/…`) → an **evaluation**.
+
+A file that declares any other `schema` is refused, naming the URL found. This page
+covers the job-record path first, then the comparison-record path.
+
+## Importing a job record
+
+Import lands the whole separation: the source **asset** it derived from, each output
+stem as an asset, and one **derivation** tying them together with a hashed reference to
+the `job.json` as evidence. After import, `verify` protects the stems and the source
+like any other asset, and `show` renders the relationship.
 
 This page is written in the project's glossary vocabulary — **asset**, **derivation**,
 **role**, **integrity state**. See [`CONTEXT.md`](../CONTEXT.md#language) for those
@@ -13,16 +26,20 @@ terms.
 ## Running it
 
 ```sh
-uncompose-project import path/to/run/job.json   # standalone
-uncompose project import path/to/run/job.json   # via the root CLI — identical behavior
+uncompose-project import path/to/run/job.json                       # standalone, cwd project
+uncompose-project import --project /abs/root /abs/root/run/job.json  # cross-tool, from any cwd
+uncompose project import path/to/run/job.json                       # via the root CLI — identical behavior
 ```
 
-The one argument is the path to a `job.json` written by a completed `uncompose`
-separation. It is relative to your current directory like every other command, and it
-follows the same path rules as `add`: an absolute path is refused (even one that lands
-inside the project), as is anything resolving outside the root. The job folder (the
-directory holding the `job.json`) and every file it names must sit inside the project
-root; import never copies files into the tree.
+Every command takes `--project <dir>` (default `.`), which names the project root
+itself — the manifest must be exactly `<dir>/uncompose.project.json`, with no search of
+parent directories. The one positional argument is the path to a `job.json` written by a
+completed `uncompose` separation, resolved against that root. Because import is the
+cross-tool handoff target, its job argument accepts an **absolute** path as well as a
+relative one, so the pinned argv above works from any directory; either way a path that
+resolves outside the root is refused. The job folder (the directory holding the
+`job.json`) and every file it names must sit inside the project root; import never copies
+files into the tree.
 
 ## What import records
 
@@ -121,7 +138,7 @@ so pipelines can gate on it.
 | --- | --- | --- |
 | **Failed outcome** | The job's `outcome` is not `"success"` (the outcome is shown) | A run that did not complete successfully is never provenance. |
 | **Bad record** | The `job.json` is missing, unreadable, unparsable, or missing a required field (the file and problem are named) | You can tell a bad path from a corrupt record. |
-| **Absolute path** | The job argument, or the record's `input_path`, is absolute — even one landing inside the root | Import applies `add`'s path rules unchanged: paths are relative to the project root, so a project stays portable. |
+| **Absolute `input_path`** | The record's own `input_path` (inside `job.json`) is absolute | A recorded path must stay root-relative and portable; `uncompose-project add` the input so import resolves it by hash. (The job *argument* on the command line may be absolute — see above.) |
 | **Job outside the root** | The `job.json` (and so its job folder) resolves outside the project root | Every recorded path stays root-relative and portable. |
 | **Stem outside the root** | A `<stem>.wav` resolves outside the project root | Same reason: the manifest never references files outside the tree. |
 | **Out-of-tree input** | No registered asset matches by hash **and** the job's `input_path` resolves outside the root | Import never copies files in; it tells you to `uncompose-project add` the input first. |
@@ -129,20 +146,74 @@ so pipelines can gate on it.
 | **Input path conflict** | The input's path is already registered with a different sha256 (both hashes named) | The manifest is never left quietly contradicting the disk. |
 | **Stem path conflict** | A stem's path is already registered with a different sha256 (both hashes named) | Same reason: a drifted file on a registered path is caught loudly. |
 
-From these rules you can predict every case: a failed run, an absolute path, a job or
+From these rules you can predict every case: a failed run, an absolute `input_path`, a job or
 stem outside the root, an input that is neither registered nor in-tree, a file that has
 drifted since the separation, or a path already registered with different bytes each
 refuse with a clear message and no partial write. Everything else — a success whose input resolves by hash or
 auto-registers in place, with stems that are new or already registered at a matching
 hash — imports.
 
+## Importing a comparison record
+
+A **comparison record** is `uncompose-compare`'s verdict: which mixes were compared and
+which one was preferred. Import records it as one **evaluation** — a summary of the
+verdict — and, exactly as with a job record, references the file behind a hashed ref
+rather than absorbing it. The observations, loops, and playback notes stay in the record
+file; the manifest keeps only what it needs to describe the verdict.
+
+```sh
+uncompose-project import evaluations/vocals.compare.json
+```
+
+Unlike a `job.json`, a comparison record is checked against a published schema:
+`uncompose-compare` owns the compare v0 schema, this repo keeps a pinned copy of it
+(`schemas/vendor/compare/v0/`), and every record is validated whole before import reads
+anything out of it. That is the same schema, and the same bytes, Compare validates
+against when it writes the record — so a record one tool accepts, the other accepts.
+Validating is not absorbing: the record's body still stays in the file behind the ref.
+
+From a compare record, import appends an evaluation with:
+
+- **`candidates`** — the compared asset ids, in the record's candidate order.
+- **`preference`** — the preferred candidate's asset id, from the record's
+  `result.preference`. The record names its preference by a candidate **label**; import
+  maps that label through the record's own candidates to an asset id. A record that
+  states no preference keeps `preference` **null**.
+- **`confidence`** — the record's `result.confidence`, copied verbatim when it carries
+  one (compare v0 makes it an integer 1–5, present exactly when there is a preference),
+  omitted otherwise.
+- **`created_at`** — the record's `completed_at`.
+- **`record`** — the hashed `{path, sha256}` reference to the comparison file.
+- **`id`** — minted from the candidate asset ids as `<a>-vs-<b>`, disambiguated with a
+  numeric suffix like every other id.
+
+The evaluation only **references** assets already registered in the project; it never
+adds one. `import` keys idempotency on the record's sha256, the same way the job path keys
+on the `job.json` sha256: re-importing the identical record is a stated no-op, while the
+same path rewritten with a different verdict imports as a second evaluation.
+
+### What the comparison import refuses, and why
+
+| Refusal | When | Why |
+| --- | --- | --- |
+| **Unrecognized schema** | The file's `schema` is neither absent (a job record) nor the compare v0 URL (the URL is shown) | One verb imports known evidence only; an unknown format is never guessed at. |
+| **Non-conforming record** | The file claims compare v0 but does not validate against it (the first violation is named) | A record that Compare itself would not have written is not evidence; guessing at its shape would record a verdict it never stated. |
+| **Candidate without an asset** | A candidate has no `asset` reference | `asset` is optional in compare v0 (a standalone session writes none), but v0.1 registers project-launched records only — every candidate must be an asset in this project. |
+| **Unknown asset** | A candidate references an asset id not registered here (the id is named) | The verdict links to assets the project already protects, never dangling ids; `uncompose-project add` it first. |
+| **Unknown preference** | The record prefers a candidate label that is not among its candidates | A preference that cannot be resolved to an asset would be a silently wrong verdict. |
+| **Record outside the root** | The comparison file resolves outside the project root | Every recorded path stays root-relative and portable; import never copies files in. |
+
 ## After import
 
 - **`verify`** re-hashes the imported stems and any auto-registered input against their
   recorded sha256 + size, reporting each asset's integrity state (verified, modified, or
-  missing) like any other asset.
+  missing) like any other asset. It also re-hashes each **evaluation record file** against
+  its recorded sha256, so a deleted or edited comparison record fails the run the same way
+  a drifted asset does.
 - **`show`** renders the derivation with its tool, version, inputs, outputs, `created`,
-  `preset`, and the hashed `job` reference, so the imported graph is readable without
-  opening JSON.
+  `preset`, and the hashed `job` reference, and lists each **evaluation** with its
+  candidates, preference, confidence, and record ref — so the imported graph is readable
+  without opening JSON.
 
-See the [ADRs](adr/) `0008`–`0010` for the decisions behind this behavior.
+See the [ADRs](adr/) `0008`–`0010` for the job-record decisions and `0012` for the
+dispatch rule and the evaluation entry.

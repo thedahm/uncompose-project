@@ -1323,6 +1323,8 @@ dependencies = [
 name = "uncompose-project-core"
 version = "0.0.0"
 dependencies = [
+ "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

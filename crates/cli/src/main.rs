@@ -4,7 +4,7 @@
 //! semantics. Errors go to stderr; a failed command exits non-zero.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -18,11 +18,17 @@ use uncompose_project_core::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Project root directory (defaults to the current directory). Names the root
+    /// itself: the manifest must be exactly `<dir>/uncompose.project.json`; no
+    /// parent directory is searched. `global` so it is accepted before or after
+    /// the subcommand.
+    #[arg(long, global = true, default_value = ".")]
+    project: PathBuf,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize the current directory as an uncompose project.
+    /// Initialize the project directory as an uncompose project.
     Init {
         /// Project name (defaults to the directory name).
         #[arg(long)]
@@ -42,7 +48,8 @@ enum Command {
     /// Import a completed uncompose job: register its input, stems, and the
     /// derivation that ties them together.
     Import {
-        /// Path to the job's `job.json`, relative to the project root.
+        /// Path to the job's `job.json`: relative to the project root, or an
+        /// absolute path that resolves inside it.
         job: PathBuf,
     },
     /// Check that each registered file still matches its recorded identity.
@@ -56,31 +63,32 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    match Cli::parse().command {
-        Command::Init { name } => run_init(name),
-        Command::Add { path, id, role } => run_add(path, id, role),
-        Command::Import { job } => run_import(job),
-        Command::Verify => run_verify(),
-        Command::Show { json } => run_show(json),
-    }
-}
-
-/// The project root every command operates on: the current directory. Reports
-/// on stderr and returns `None` when it cannot be determined.
-fn project_root() -> Option<PathBuf> {
-    match std::env::current_dir() {
-        Ok(dir) => Some(dir),
+    let cli = Cli::parse();
+    // Resolve `--project` (default `.`) to an absolute root once, up front, so every
+    // command names the same directory and the pinned cross-tool argv works from any
+    // cwd with absolute paths. Canonicalizing also anchors the manifest at exactly
+    // `<dir>/uncompose.project.json` with no upward walk — a missing directory is an
+    // error here rather than a confusing "not a project" later.
+    let root = match cli.project.canonicalize() {
+        Ok(root) => root,
         Err(e) => {
-            eprintln!("error: cannot determine the current directory: {e}");
-            None
+            eprintln!(
+                "error: cannot access project directory {}: {e}",
+                cli.project.display()
+            );
+            return ExitCode::FAILURE;
         }
+    };
+    match cli.command {
+        Command::Init { name } => run_init(&root, name),
+        Command::Add { path, id, role } => run_add(&root, path, id, role),
+        Command::Import { job } => run_import(&root, job),
+        Command::Verify => run_verify(&root),
+        Command::Show { json } => run_show(&root, json),
     }
 }
 
-fn run_init(name: Option<String>) -> ExitCode {
-    let Some(root) = project_root() else {
-        return ExitCode::FAILURE;
-    };
+fn run_init(root: &Path, name: Option<String>) -> ExitCode {
     let name = match name {
         Some(name) => name,
         None => match root.file_name().and_then(|s| s.to_str()) {
@@ -94,7 +102,7 @@ fn run_init(name: Option<String>) -> ExitCode {
             }
         },
     };
-    match init(&root, &name) {
+    match init(root, &name) {
         Ok(path) => {
             println!(
                 "Initialized uncompose project '{name}' ({})",
@@ -109,11 +117,8 @@ fn run_init(name: Option<String>) -> ExitCode {
     }
 }
 
-fn run_verify() -> ExitCode {
-    let Some(root) = project_root() else {
-        return ExitCode::FAILURE;
-    };
-    let report = match verify(&root) {
+fn run_verify(root: &Path) -> ExitCode {
+    let report = match verify(root) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("error: {e}");
@@ -122,9 +127,10 @@ fn run_verify() -> ExitCode {
     };
 
     // Passes to stdout; failures to stderr as warnings naming path and cause.
+    // Evaluation record files (report.records) are policed the same way as assets.
     let mut modified = 0;
     let mut missing = 0;
-    for status in &report.statuses {
+    for status in report.statuses.iter().chain(&report.records) {
         match status.integrity {
             Integrity::Verified => println!("verified  {}", status.path),
             Integrity::Modified => {
@@ -148,11 +154,8 @@ fn run_verify() -> ExitCode {
 
 /// Print the project overview, or with `--json` the manifest bytes verbatim
 /// (byte-identical to the file, for scripts and pipelines).
-fn run_show(json: bool) -> ExitCode {
-    let Some(root) = project_root() else {
-        return ExitCode::FAILURE;
-    };
-    match show(&root) {
+fn run_show(root: &Path, json: bool) -> ExitCode {
+    match show(root) {
         Ok(out) => {
             if json {
                 // A short write here (closed pipe, full disk) must not exit 0:
@@ -196,11 +199,8 @@ fn stem_tally(stems: &[ImportedAsset]) -> String {
     }
 }
 
-fn run_import(job: PathBuf) -> ExitCode {
-    let Some(root) = project_root() else {
-        return ExitCode::FAILURE;
-    };
-    match import(&root, &job) {
+fn run_import(root: &Path, job: PathBuf) -> ExitCode {
+    match import(root, &job) {
         Ok(ImportOutcome::Imported(report)) => {
             println!(
                 "Imported '{}' ({})",
@@ -238,6 +238,34 @@ fn run_import(job: PathBuf) -> ExitCode {
             println!("Already imported as '{derivation_id}'; job.json unchanged, nothing to do");
             ExitCode::SUCCESS
         }
+        Ok(ImportOutcome::EvaluationImported(report)) => {
+            println!("Imported evaluation '{}'", report.evaluation_id);
+            println!("  candidates: {}", report.candidates.join(", "));
+            println!(
+                "  preference: {}",
+                report.preference.as_deref().unwrap_or("none")
+            );
+            if let Some(confidence) = &report.confidence {
+                // A string confidence prints bare; anything else as compact JSON.
+                match confidence.as_str() {
+                    Some(s) => println!("  confidence: {s}"),
+                    None => println!("  confidence: {confidence}"),
+                }
+            }
+            // The record ref closes the summary the way the job arm's `derivation:`
+            // does: the thing the entry now points at, which the header did not say.
+            println!(
+                "  record:     {} (sha256 {})",
+                report.record_path, report.record_sha256
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(ImportOutcome::EvaluationAlreadyImported { evaluation_id }) => {
+            println!(
+                "Already imported as evaluation '{evaluation_id}'; record unchanged, nothing to do"
+            );
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -245,11 +273,8 @@ fn run_import(job: PathBuf) -> ExitCode {
     }
 }
 
-fn run_add(path: PathBuf, id: Option<String>, role: String) -> ExitCode {
-    let Some(root) = project_root() else {
-        return ExitCode::FAILURE;
-    };
-    match add(&root, &path, id.as_deref(), &role) {
+fn run_add(root: &Path, path: PathBuf, id: Option<String>, role: String) -> ExitCode {
+    match add(root, &path, id.as_deref(), &role) {
         Ok(asset) => {
             println!(
                 "Added asset '{}' ({}, {} bytes, role {})",

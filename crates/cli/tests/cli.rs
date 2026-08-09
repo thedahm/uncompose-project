@@ -5,10 +5,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
-use uncompose_project_core::{tagline, MANIFEST_FILENAME, SCHEMA_URL};
+use uncompose_project_core::{
+    tagline, COMPARE_SCHEMA_URL, LOCK_FILENAME, LOCK_WAIT_NOTICE, MANIFEST_FILENAME, SCHEMA_URL,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_uncompose-project");
 
@@ -469,6 +472,33 @@ fn show_refuses_a_derivation_with_an_unknown_field() {
         "error should name the offending field: {stderr}"
     );
 }
+
+/// `preference` is required on an evaluation (the schema lists it, and `null` is
+/// the meaningful "no preference" verdict), so a manifest missing the key is
+/// off-shape rather than parsing and silently gaining a null on the next rewrite.
+#[test]
+fn show_refuses_an_evaluation_missing_its_preference() {
+    let dir = TempDir::new().unwrap();
+    let bogus = format!(
+        "{{\n  \"schema\": \"{SCHEMA_URL}\",\n  \"project\": {{ \"id\": \"01ARZ3\", \"name\": \"x\", \"created_at\": \"2020-01-01T00:00:00Z\" }},\n  \"assets\": [],\n  \"derivations\": [],\n  \"evaluations\": [\n    {{\n      \"id\": \"a-vs-b\",\n      \"candidates\": [\"a\", \"b\"],\n      \"created_at\": \"2020-01-02T00:00:00Z\",\n      \"record\": {{ \"path\": \"evaluations/cmp.json\", \"sha256\": \"{ZERO_SHA256}\" }}\n    }}\n  ]\n}}\n"
+    );
+    fs::write(dir.path().join(MANIFEST_FILENAME), &bogus).unwrap();
+
+    let output = run(dir.path(), &["show"]);
+
+    assert!(
+        !output.status.success(),
+        "an evaluation without `preference` should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("preference"),
+        "error should name the missing field: {stderr}"
+    );
+}
+
+/// A syntactically valid sha256 for hand-written manifest fixtures.
+const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A derivation missing a required field (here `tool`) is off-shape, not
 /// best-effort-rendered.
@@ -1097,10 +1127,10 @@ fn import_reuses_a_registered_asset_matching_the_input_hash() {
     assert_valid_against_schema(&manifest);
 }
 
-/// Acceptance: import applies `add`'s path rules, so an absolute job path refuses
-/// even when it lands inside the root; the manifest is left byte-identical.
+/// Acceptance: `import` is the cross-tool handoff target, so an absolute job path
+/// that lands inside the root is accepted (the pinned argv passes absolute paths).
 #[test]
-fn import_refuses_an_absolute_job_path() {
+fn import_accepts_an_absolute_job_path_inside_the_root() {
     let dir = init_project();
     let job = synth_job(
         dir.path(),
@@ -1111,25 +1141,18 @@ fn import_refuses_an_absolute_job_path() {
         &["vocals"],
         "success",
     );
-    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
     let abs = dir.path().join(&job);
 
     let output = run(dir.path(), &["import", abs.to_str().unwrap()]);
     assert!(
-        !output.status.success(),
-        "an absolute job path should refuse"
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("absolute path") && stderr.contains("relative to the project root"),
-        "error should say what to pass instead: {stderr}"
+        output.status.success(),
+        "an absolute in-root job path should import: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
-    assert_eq!(
-        before, after,
-        "a refused import leaves the manifest untouched"
-    );
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
 }
 
 /// Acceptance: a job folder outside the project root refuses; the manifest is
@@ -1547,4 +1570,780 @@ fn verify_refuses_when_the_directory_is_not_a_project() {
     let output = run(dir.path(), &["verify"]);
     assert!(!output.status.success());
     assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+}
+
+// --- M5 slice 1: the `--project` flag everywhere and the flock sidecar ---
+
+/// DoD: the pinned cross-tool argv `import --project <abs-root> <abs-job.json>`
+/// registers a job from any cwd, with both paths absolute.
+#[test]
+fn import_project_flag_works_with_absolute_paths_from_an_unrelated_cwd() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    let job_abs = dir.path().join(&job);
+    // Run from a directory that is not the project and not its parent.
+    let elsewhere = TempDir::new().unwrap();
+
+    let output = Command::new(BIN)
+        .args([
+            "import",
+            "--project",
+            dir.path().to_str().unwrap(),
+            job_abs.to_str().unwrap(),
+        ])
+        .current_dir(elsewhere.path())
+        .output()
+        .expect("failed to run the binary");
+    assert!(
+        output.status.success(),
+        "pinned argv should import from any cwd: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
+}
+
+/// `--project` names the root itself: every command reads exactly
+/// `<dir>/uncompose.project.json` and works from an unrelated cwd.
+#[test]
+fn every_command_honors_project_flag_from_an_unrelated_cwd() {
+    let root = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let at = |args: &[&str]| -> Output {
+        let mut full = vec!["--project", root.path().to_str().unwrap()];
+        full.extend_from_slice(args);
+        Command::new(BIN)
+            .args(&full)
+            .current_dir(elsewhere.path())
+            .output()
+            .expect("failed to run the binary")
+    };
+
+    assert!(at(&["init", "--name", "remote"]).status.success());
+    assert!(root.path().join(MANIFEST_FILENAME).exists());
+    fs::write(root.path().join("song.wav"), b"hello").unwrap();
+    assert!(at(&["add", "song.wav"]).status.success());
+    assert!(at(&["verify"]).status.success());
+    let show = at(&["show"]);
+    assert!(show.status.success());
+    assert!(String::from_utf8(show.stdout).unwrap().contains("remote"));
+}
+
+/// No upward walk: pointing `--project` at a subdirectory of a project refuses,
+/// naming the manifest path it looked for (never the parent's manifest).
+#[test]
+fn project_flag_does_not_walk_up_to_a_parent_manifest() {
+    let dir = init_project();
+    let sub = dir.path().join("nested");
+    fs::create_dir(&sub).unwrap();
+
+    let output = run(&sub, &["show"]);
+    assert!(
+        !output.status.success(),
+        "a subdirectory of a project is not itself a project"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not an uncompose project"),
+        "should refuse as not-a-project: {stderr}"
+    );
+    assert!(
+        stderr.contains(&sub.join(MANIFEST_FILENAME).display().to_string()),
+        "should name the manifest path it expected, not the parent's: {stderr}"
+    );
+}
+
+/// Spawn a background process that acquires the exclusive project lock, signals
+/// readiness by creating `marker`, then holds the lock until it exits. Uses
+/// `flock --no-fork ... exec sleep`, so the single held process can be SIGKILLed
+/// to release the lock (no forked child inherits the locked fd).
+#[cfg(unix)]
+fn spawn_lock_holder(root: &Path, marker: &Path, hold_secs: u32) -> std::process::Child {
+    let lock = root.join(LOCK_FILENAME);
+    Command::new("flock")
+        .arg("--no-fork")
+        .arg(&lock)
+        .arg("sh")
+        .arg("-c")
+        .arg(format!(
+            "touch {}; exec sleep {hold_secs}",
+            marker.display()
+        ))
+        .spawn()
+        .expect("failed to spawn flock lock holder")
+}
+
+/// Wait until `marker` appears — i.e. the holder has the lock — or time out.
+#[cfg(unix)]
+fn wait_for(marker: &Path) {
+    let start = Instant::now();
+    while !marker.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "lock holder never signaled readiness"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A contended mutating command waits for the lock (printing the notice) and then
+/// succeeds once the holder releases it — a blocking wait, never a fail-fast.
+#[cfg(unix)]
+#[test]
+fn a_held_lock_makes_a_mutating_command_wait_then_succeed() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let marker = dir.path().join("holder-ready");
+
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 2);
+    wait_for(&marker);
+
+    // `add` must block on the held lock, print the notice, then succeed.
+    let start = Instant::now();
+    let output = run(dir.path(), &["add", "song.wav"]);
+    let waited = start.elapsed();
+    holder.wait().unwrap();
+
+    assert!(
+        output.status.success(),
+        "add should wait for the lock then succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(LOCK_WAIT_NOTICE),
+        "a contended command should print the waiting notice: {stderr}"
+    );
+    assert!(
+        waited >= Duration::from_millis(500),
+        "add should have blocked until the holder released, waited {waited:?}"
+    );
+    assert_eq!(
+        read_manifest(dir.path())["assets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Two real processes mutating one project concurrently both succeed, and the
+/// manifest ends canonical and complete — neither write is lost (the DoD).
+#[cfg(unix)]
+#[test]
+fn two_concurrent_adds_both_land_without_losing_a_write() {
+    let dir = init_project();
+    fs::write(dir.path().join("a.wav"), b"aaaa").unwrap();
+    fs::write(dir.path().join("b.wav"), b"bbbbb").unwrap();
+
+    let spawn_add = |file: &str| {
+        Command::new(BIN)
+            .args(["add", file])
+            .current_dir(dir.path())
+            .spawn()
+            .expect("failed to spawn add")
+    };
+    // Spawn both before waiting on either, so their read-modify-writes overlap.
+    let mut first = spawn_add("a.wav");
+    let mut second = spawn_add("b.wav");
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+
+    let manifest = read_manifest(dir.path());
+    let assets = manifest["assets"].as_array().unwrap();
+    let mut ids: Vec<&str> = assets.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["a", "b"], "both adds must survive; no lost write");
+    // The manifest is canonical (reparses, ends in a trailing newline) and valid.
+    let bytes = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert!(
+        bytes.ends_with("}\n"),
+        "manifest should end canonical: {bytes}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Crash recovery: a killed lock holder releases its advisory lock (kernel
+/// cleanup), so the next mutating command acquires immediately rather than
+/// wedging. If the lock leaked, this `add` would block forever.
+#[cfg(unix)]
+#[test]
+fn a_killed_lock_holder_does_not_wedge_the_next_command() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let marker = dir.path().join("holder-ready");
+
+    // Holder grabs the lock and would hold it for an hour…
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 3600);
+    wait_for(&marker);
+    // …but is killed mid-hold. The kernel releases the advisory lock.
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav"]);
+    assert!(
+        output.status.success(),
+        "a killed holder must not wedge the next command: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_manifest(dir.path())["assets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// `verify`'s `last_verified` refresh is a read-modify-write like any other, so a
+/// mutator that commits *during* the hash pass must survive it. The hash pass runs
+/// off a snapshot taken before it; writing that snapshot back would erase whatever
+/// landed meanwhile — a lost asset, not just a lost timestamp.
+#[cfg(unix)]
+#[test]
+fn verify_does_not_clobber_a_write_committed_during_its_hash_pass() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    assert!(run(dir.path(), &["add", "song.wav"]).status.success());
+    let marker = dir.path().join("holder-ready");
+
+    // A holder pins the lock, so `verify` gets through its whole hash pass and then
+    // blocks at the stamp write — the exact window a concurrent mutator commits in.
+    let mut holder = spawn_lock_holder(dir.path(), &marker, 2);
+    wait_for(&marker);
+    let mut verify = Command::new(BIN)
+        .arg("verify")
+        .current_dir(dir.path())
+        .spawn()
+        .expect("failed to spawn verify");
+
+    // Stand in for that mutator: `verify`'s snapshot is already read, and this
+    // write lands before it can take the lock.
+    std::thread::sleep(Duration::from_millis(300));
+    let mut manifest = read_manifest(dir.path());
+    manifest["assets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "late",
+            "path": "late.wav",
+            "sha256": ZERO_SHA256,
+            "size": 4,
+            "role": "mix",
+            "added_at": "2020-01-02T00:00:00Z",
+        }));
+    fs::write(
+        dir.path().join(MANIFEST_FILENAME),
+        format!("{manifest:#}\n"),
+    )
+    .unwrap();
+
+    holder.wait().unwrap();
+    assert!(verify.wait().unwrap().success());
+
+    let after = read_manifest(dir.path());
+    let ids: Vec<&str> = after["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"late"),
+        "the concurrent write must survive verify's stamp: {ids:?}"
+    );
+    // And the stamp itself still landed on what verify actually verified.
+    let song = after["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "song")
+        .unwrap();
+    assert!(
+        song["last_verified"].is_string(),
+        "the verified asset should still be stamped: {song}"
+    );
+}
+
+// --- M5 slice 2: import dispatch on schema URL, evaluation import ---
+
+/// Register two mixes to compare, then write a conforming compare v0 record
+/// (uncompose#65) into `<root>/evaluations/<name>.json` referencing them by asset
+/// id. `preference` is the preferred candidate's label (or `Value::Null` for no
+/// preference), which import maps through `candidates` to an asset id; the schema
+/// requires a 1–5 `confidence` beside a non-null preference and forbids one beside
+/// a null preference. Returns the record path relative to root.
+fn synth_compare(
+    root: &Path,
+    name: &str,
+    a_asset: &str,
+    b_asset: &str,
+    preference: Value,
+    confidence: Option<Value>,
+    completed_at: &str,
+) -> String {
+    let eval_dir = root.join("evaluations");
+    fs::create_dir_all(&eval_dir).unwrap();
+    let mut result = serde_json::json!({ "preference": preference });
+    if let Some(c) = confidence {
+        result["confidence"] = c;
+    }
+    let record = serde_json::json!({
+        "schema": COMPARE_SCHEMA_URL,
+        "id": "01J4QF8ZK3M2X7W9C5V1B6N4TQ",
+        "created_at": "2020-01-02T00:00:00Z",
+        "completed_at": completed_at,
+        "candidates": [
+            { "label": "A", "path": "mix-a.wav", "sha256": A_SHA256, "size": 4, "asset": a_asset },
+            { "label": "B", "path": "mix-b.wav", "sha256": B_SHA256, "size": 4, "asset": b_asset },
+        ],
+        "mode": "ab-blind",
+        "playback": { "loudness_match": { "enabled": false } },
+        // The body the manifest must reference rather than absorb.
+        "observations": [
+            { "at": "2020-01-02T00:05:00Z", "text": "stays in the record file" },
+        ],
+        "result": result,
+    });
+    let rel = format!("evaluations/{name}.json");
+    fs::write(root.join(&rel), record.to_string()).unwrap();
+    rel
+}
+
+/// sha256 of `b"aaaa"` / `b"bbbb"` — the two mixes `project_with_two_mixes`
+/// registers, as a real record carries them alongside the asset refs.
+const A_SHA256: &str = "61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4";
+const B_SHA256: &str = "81cc5b17018674b401b42f35ba07bb79e211239c23bffe658da1577e3e646877";
+
+/// Register `mix-a.wav` and `mix-b.wav` so their auto-minted ids are `mix-a` and
+/// `mix-b`, and return the project.
+fn project_with_two_mixes() -> TempDir {
+    let dir = init_project();
+    fs::write(dir.path().join("mix-a.wav"), b"aaaa").unwrap();
+    fs::write(dir.path().join("mix-b.wav"), b"bbbb").unwrap();
+    assert!(run(dir.path(), &["add", "mix-a.wav"]).status.success());
+    assert!(run(dir.path(), &["add", "mix-b.wav"]).status.success());
+    dir
+}
+
+/// Happy path: a compare record imports as one evaluation whose full content is
+/// correct — candidates in record order, preference mapped label→asset, confidence
+/// copied, created_at from the record, and a hashed record ref.
+#[test]
+fn import_lands_a_compare_record_as_one_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("evaluation") && stdout.contains("mix-a") && stdout.contains("mix-b"),
+        "summary should name the evaluation and candidates: {stdout}"
+    );
+    assert!(
+        stdout.contains("record:") && stdout.contains("evaluations/cmp.json"),
+        "summary should name the hashed record the entry now points at: {stdout}"
+    );
+
+    let manifest = read_manifest(dir.path());
+    // No new assets/derivations — an evaluation only references existing assets.
+    assert_eq!(manifest["assets"].as_array().unwrap().len(), 2);
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 0);
+
+    let evals = manifest["evaluations"].as_array().unwrap();
+    assert_eq!(evals.len(), 1);
+    let e = &evals[0];
+    assert_eq!(e["id"], "mix-a-vs-mix-b");
+    assert_eq!(e["candidates"], serde_json::json!(["mix-a", "mix-b"]));
+    // Preference resolved the label "A" through candidates to the asset id.
+    assert_eq!(e["preference"], "mix-a");
+    assert_eq!(e["confidence"], 4);
+    assert_eq!(e["created_at"], "2020-01-03T00:00:00Z");
+    assert_eq!(e["record"]["path"], "evaluations/cmp.json");
+    let sha = e["record"]["sha256"].as_str().unwrap();
+    assert_eq!(sha.len(), 64);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    // The record's observations were not absorbed into the manifest.
+    assert!(
+        !manifest.to_string().contains("stays in the record file"),
+        "the verdict is referenced, not duplicated: {manifest}"
+    );
+
+    assert_valid_against_schema(&manifest);
+}
+
+/// A record with no preference keeps `preference` null in the evaluation, and a
+/// missing confidence is omitted rather than written as null.
+#[test]
+fn import_maps_a_null_preference_to_null_and_omits_missing_confidence() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "tie",
+        "mix-a",
+        "mix-b",
+        Value::Null,
+        None,
+        "2020-01-03T00:00:00Z",
+    );
+
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    let e = &manifest["evaluations"].as_array().unwrap()[0];
+    assert!(e["preference"].is_null(), "null preference stays null: {e}");
+    assert!(
+        e.get("confidence").is_none(),
+        "a missing confidence is omitted, not null: {e}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// Regression: a job.json (no `schema` field) still imports as a derivation — the
+/// dispatch leaves the original path byte-for-byte unchanged.
+#[test]
+fn import_still_dispatches_a_schemaless_job_record_to_the_job_path() {
+    let dir = init_project();
+    let job = synth_job(
+        dir.path(),
+        "mix.wav",
+        b"hello",
+        HELLO_SHA256,
+        "run1",
+        &["vocals"],
+        "success",
+    );
+    assert!(run(dir.path(), &["import", &job]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    assert_eq!(manifest["derivations"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["evaluations"].as_array().unwrap().len(), 0);
+}
+
+/// A file whose `schema` is neither absent nor the compare URL refuses, naming the
+/// URL found, and leaves the manifest untouched.
+#[test]
+fn import_refuses_an_unrecognized_schema_url() {
+    let dir = init_project();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let bogus = "https://uncompose.org/schemas/compare/v99/uncompose.compare.schema.json";
+    fs::write(
+        dir.path().join("other.json"),
+        serde_json::json!({ "schema": bogus }).to_string(),
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["import", "other.json"]);
+    assert!(!output.status.success(), "an unknown schema should refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(bogus),
+        "the error should name the schema URL found: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+/// A candidate with no `asset` ref refuses: v0.1 registers project-launched
+/// records only.
+#[test]
+fn import_refuses_a_candidate_without_an_asset_ref() {
+    let dir = project_with_two_mixes();
+    // A conforming record in every other respect — `asset` is optional in compare
+    // v0 (a standalone session writes none), so this refusal is the project's, not
+    // the schema's.
+    let rel = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    let path = dir.path().join(&rel);
+    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    record["candidates"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("asset");
+    fs::write(&path, record.to_string()).unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", "evaluations/cmp.json"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("asset"),
+        "the error should mention the missing asset ref: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// A candidate referencing an asset id absent from the manifest refuses, naming it.
+#[test]
+fn import_refuses_a_candidate_asset_absent_from_the_manifest() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "ghost",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("ghost"),
+        "the error should name the unknown asset: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// A compare record outside the project root refuses; the manifest is untouched.
+#[test]
+fn import_refuses_a_compare_record_outside_the_project_root() {
+    let dir = project_with_two_mixes();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let outside = dir.path().parent().unwrap().join("uncompose-outside-cmp");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("cmp.json"),
+        serde_json::json!({ "schema": COMPARE_SCHEMA_URL }).to_string(),
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["import", "../uncompose-outside-cmp/cmp.json"]);
+    let _ = fs::remove_dir_all(&outside);
+    assert!(
+        !output.status.success(),
+        "an out-of-root record should refuse"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("outside the project root"),
+        "the error should name the confinement: {stderr}"
+    );
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// Idempotency: re-importing the same compare record (matching sha256) exits 0 as
+/// a stated no-op and leaves the manifest byte-identical.
+#[test]
+fn a_second_import_of_the_same_compare_record_is_a_stated_noop() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+    let after_first = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["import", &record]);
+    assert!(
+        output.status.success(),
+        "a re-import must exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.to_lowercase().contains("already") && stdout.contains("mix-a-vs-mix-b"),
+        "the no-op should name the existing evaluation: {stdout}"
+    );
+    assert_eq!(
+        after_first,
+        fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap()
+    );
+}
+
+/// The same record path with different bytes imports as a second evaluation.
+#[test]
+fn a_modified_compare_record_at_the_same_path_imports_a_second_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    // Rewrite the record in place with a different verdict — same path, new bytes.
+    synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("B"),
+        Some(Value::from(5)),
+        "2020-01-04T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let manifest = read_manifest(dir.path());
+    let evals = manifest["evaluations"].as_array().unwrap();
+    assert_eq!(evals.len(), 2, "a differently-hashed record is a new entry");
+    // The disambiguated id keeps the second entry distinct.
+    assert_eq!(evals[0]["id"], "mix-a-vs-mix-b");
+    assert_eq!(evals[1]["id"], "mix-a-vs-mix-b-2");
+    let prefs: Vec<&Value> = evals.iter().map(|e| &e["preference"]).collect();
+    assert!(
+        prefs.contains(&&Value::from("mix-a")) && prefs.contains(&&Value::from("mix-b")),
+        "both verdicts recorded: {prefs:?}"
+    );
+    assert_valid_against_schema(&manifest);
+}
+
+/// `show` renders an imported evaluation: id, candidates, preference, confidence,
+/// and the hashed record ref.
+#[test]
+fn show_renders_an_imported_evaluation() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    let show = run(dir.path(), &["show"]);
+    assert!(show.status.success());
+    let stdout = String::from_utf8(show.stdout).unwrap();
+    assert!(stdout.contains("Evaluations (1)"), "{stdout}");
+    assert!(stdout.contains("mix-a-vs-mix-b"), "{stdout}");
+    assert!(
+        stdout.contains("preference") && stdout.contains("mix-a"),
+        "overview should show the preference: {stdout}"
+    );
+    assert!(
+        stdout.contains("confidence: 4"),
+        "overview should show the confidence: {stdout}"
+    );
+    assert!(
+        stdout.contains("evaluations/cmp.json"),
+        "overview should show the record ref path: {stdout}"
+    );
+}
+
+/// `verify` polices an evaluation's record file: a missing record fails the run,
+/// and its path is reported missing.
+#[test]
+fn verify_flags_a_missing_evaluation_record() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+    // A clean project verifies (assets and the record file all present).
+    assert!(run(dir.path(), &["verify"]).status.success());
+
+    fs::remove_file(dir.path().join(&record)).unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "a missing record file should fail verify"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("evaluations/cmp.json") && combined.contains("missing"),
+        "verify should report the record path missing: {combined}"
+    );
+}
+
+/// `verify` flags an evaluation record whose bytes changed after import as
+/// modified.
+#[test]
+fn verify_flags_a_modified_evaluation_record() {
+    let dir = project_with_two_mixes();
+    let record = synth_compare(
+        dir.path(),
+        "cmp",
+        "mix-a",
+        "mix-b",
+        Value::from("A"),
+        Some(Value::from(4)),
+        "2020-01-03T00:00:00Z",
+    );
+    assert!(run(dir.path(), &["import", &record]).status.success());
+
+    // Tamper with the record file after import.
+    fs::write(dir.path().join(&record), b"{}").unwrap();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        !output.status.success(),
+        "a modified record file should fail verify"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("evaluations/cmp.json") && combined.contains("modified"),
+        "verify should report the record path modified: {combined}"
+    );
 }
