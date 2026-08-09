@@ -1125,7 +1125,7 @@ fn import_evaluation(
     // The id names the matchup: `<a>-vs-<b>` from the candidate asset ids,
     // disambiguated against existing evaluation ids by the numeric-suffix rule.
     let base = slugify(&candidate_assets.join("-vs-"));
-    let taken: HashSet<String> = manifest.evaluations.iter().map(|e| e.id.clone()).collect();
+    let taken: HashSet<&str> = manifest.evaluations.iter().map(|e| e.id.as_str()).collect();
     let evaluation_id = mint_id_with(&base, |c| taken.contains(c));
 
     // Confidence is copied only when the record actually carries one.
@@ -1318,8 +1318,7 @@ pub fn verify(root: &Path) -> Result<VerifyReport, VerifyError> {
     // missing file reads missing and a byte change reads modified.
     let mut records = Vec::with_capacity(manifest.evaluations.len());
     for evaluation in &manifest.evaluations {
-        let integrity =
-            check_record_integrity(root, &evaluation.record.path, &evaluation.record.sha256)?;
+        let integrity = check_record_integrity(root, &evaluation.record)?;
         records.push(AssetStatus {
             id: evaluation.id.clone(),
             path: evaluation.record.path.clone(),
@@ -1334,24 +1333,16 @@ pub fn verify(root: &Path) -> Result<VerifyReport, VerifyError> {
 /// manifest records no size for it, only the hashed ref, so there is no
 /// size-first shortcut: a file that is not there is [`Integrity::Missing`]; bytes
 /// that no longer hash to the recorded sha256 are [`Integrity::Modified`].
-fn check_record_integrity(
-    root: &Path,
-    rel_path: &str,
-    expected_sha: &str,
-) -> Result<Integrity, VerifyError> {
-    let rel: PathBuf = rel_path.split('/').collect();
+fn check_record_integrity(root: &Path, record: &EvalRecord) -> Result<Integrity, VerifyError> {
+    // Stored paths are forward-slash and root-relative; rebuild per-OS components.
+    let rel: PathBuf = record.path.split('/').collect();
     let path = root.join(rel);
-    match std::fs::metadata(&path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Integrity::Missing),
-        Err(e) => return Err(VerifyError::Unreadable(path, e)),
+    match sha256_file(&path) {
+        Ok((sha256, _)) if sha256 == record.sha256 => Ok(Integrity::Verified),
+        Ok(_) => Ok(Integrity::Modified),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Integrity::Missing),
+        Err(e) => Err(VerifyError::Unreadable(path, e)),
     }
-    let (sha256, _) = sha256_file(&path).map_err(|e| VerifyError::Unreadable(path, e))?;
-    Ok(if sha256 == expected_sha {
-        Integrity::Verified
-    } else {
-        Integrity::Modified
-    })
 }
 
 /// Derive one asset's integrity from disk: size first (cheap), then sha256. A

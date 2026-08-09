@@ -247,11 +247,10 @@ fn run_import(root: &Path, job: PathBuf) -> ExitCode {
             );
             if let Some(confidence) = &report.confidence {
                 // A string confidence prints bare; anything else as compact JSON.
-                let rendered = confidence
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| confidence.to_string());
-                println!("  confidence: {rendered}");
+                match confidence.as_str() {
+                    Some(s) => println!("  confidence: {s}"),
+                    None => println!("  confidence: {confidence}"),
+                }
             }
             println!("  evaluation: {}", report.evaluation_id);
             ExitCode::SUCCESS
