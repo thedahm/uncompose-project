@@ -32,6 +32,12 @@ completed `uncompose` job record and lands its source, output stems, and their
 derivation in one step — see [Importing a job](docs/import.md) for what it records, what
 it refuses and why, and how re-import stays idempotent.
 
+Every command takes `--project <dir>` (default `.`) to name the project root explicitly,
+so you can operate on a project from any directory; it names the root itself, with no
+search of parent directories. Each mutating command (`init`, `add`, `import`) serializes
+its write behind an advisory lock at `<root>/.uncompose.project.lock`, so concurrent
+writers wait rather than corrupt or lose a write.
+
 ## Responsible use
 
 `uncompose-project` records and verifies audio you provide, entirely on your own machine —

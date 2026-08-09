@@ -233,22 +233,37 @@ fn import_refuses_an_input_path_registered_with_a_conflicting_hash() {
     }
 }
 
-/// Absolute paths refuse the same way `add` refuses them, even when the absolute
-/// form lands inside the root — the spec pins import to `add`'s path rules.
+/// `import` is the cross-tool handoff target (`import --project <abs-root>
+/// <abs-job.json>`), so an absolute job path that resolves inside the root is
+/// accepted, not refused (ADR-0011). Confinement is unchanged.
 #[test]
-fn import_refuses_an_absolute_job_path_inside_the_root() {
+fn import_accepts_an_absolute_job_path_inside_the_root() {
     let dir = project();
     let job = synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
     let abs = dir.path().join(&job);
 
+    let outcome = import(dir.path(), &abs).unwrap();
+    assert!(
+        matches!(outcome, ImportOutcome::Imported(_)),
+        "an absolute in-root job path should import: {outcome:?}"
+    );
+}
+
+/// An absolute job path that resolves outside the root still refuses — the
+/// confinement rule is enforced by resolution, not by rejecting absolute paths.
+#[test]
+fn import_refuses_an_absolute_job_path_outside_the_root() {
+    let dir = project();
+    synth_job(dir.path(), b"hello", HELLO_SHA256, "success");
+    // A real job.json in a sibling directory, referenced by its absolute path.
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("job.json"), b"{}").unwrap();
+    let abs = outside.path().join("job.json");
+
     let err = import(dir.path(), &abs).unwrap_err();
     assert!(
-        matches!(err, ImportError::JobAbsolutePath(_)),
-        "got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("relative to the project root"),
-        "message should say what to pass instead: {err}"
+        matches!(err, ImportError::JobOutsideRoot(_)),
+        "an out-of-root absolute job path should refuse: {err:?}"
     );
 }
 
