@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Merge the following branches into `{{SPEC_BRANCH}}`, each via a pull request so the work leaves a paper trail on GitHub:
@@ -22,7 +24,7 @@ After all branches are merged, run the repo checks on `{{SPEC_BRANCH}}` one fina
 
 # REPO CHECKS
 
-`cargo test` at the repo root runs everything, plus `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (see CONTRIBUTING.md). If the touched code has other documented checks (e.g. Python packaging via `ci/smoke-wheel.sh`), run those too.
+{{REPO_CHECKS}}
 
 # CLOSE ISSUES
 

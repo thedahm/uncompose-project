@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Perform the final review of PR #{{PR_NUMBER}} (`{{SPEC_BRANCH}}` → `main`), which delivers spec issue #{{SPEC_ISSUE}}, and post your findings as a comment on the PR.

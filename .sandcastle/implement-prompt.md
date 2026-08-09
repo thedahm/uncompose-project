@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Fix issue {{TASK_ID}}: {{ISSUE_TITLE}}
@@ -35,7 +37,9 @@ If applicable, use RGR (or the /tdd skill) to complete the task.
 
 # FEEDBACK LOOPS
 
-Before committing, run the repo checks: `cargo test`, `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets -- -D warnings` (see CONTRIBUTING.md), plus any other documented checks for the surfaces you touched.
+Before committing, run the repo checks:
+
+{{REPO_CHECKS}}
 
 # COMMIT
 
