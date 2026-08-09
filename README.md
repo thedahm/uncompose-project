@@ -24,6 +24,14 @@ tag.
 pip install uncompose-project        # placeholder — lands with v0.1.0
 ```
 
+## Commands
+
+`init` creates a project, `add` registers a file as an asset, `verify` checks the
+registered assets against disk, and `show` renders the manifest. `import` reads a
+completed `uncompose` job record and lands its source, output stems, and their
+derivation in one step — see [Importing a job](docs/import.md) for what it records, what
+it refuses and why, and how re-import stays idempotent.
+
 ## Responsible use
 
 `uncompose-project` records and verifies audio you provide, entirely on your own machine —

@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use uncompose_project_core::{add, init, show, tagline, verify, Integrity, DEFAULT_ROLE};
+use uncompose_project_core::{
+    add, import, init, show, tagline, verify, AssetOrigin, ImportOutcome, ImportedAsset, Integrity,
+    DEFAULT_ROLE,
+};
 
 #[derive(Parser)]
 #[command(name = "uncompose-project", version, about = tagline(), arg_required_else_help = true)]
@@ -36,6 +39,12 @@ enum Command {
         #[arg(long, default_value = DEFAULT_ROLE)]
         role: String,
     },
+    /// Import a completed uncompose job: register its input, stems, and the
+    /// derivation that ties them together.
+    Import {
+        /// Path to the job's `job.json`, relative to the project root.
+        job: PathBuf,
+    },
     /// Check that each registered file still matches its recorded identity.
     Verify,
     /// Print a readable overview of the project, its assets, and derivations.
@@ -50,6 +59,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Init { name } => run_init(name),
         Command::Add { path, id, role } => run_add(path, id, role),
+        Command::Import { job } => run_import(job),
         Command::Verify => run_verify(),
         Command::Show { json } => run_show(json),
     }
@@ -155,6 +165,77 @@ fn run_show(json: bool) -> ExitCode {
             } else {
                 print!("{}", out.overview);
             }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Render an import's stem count with its registered/reused split — `2 stems: 1
+/// registered, 1 reused`. Zero-count halves are left out, so the common all-new
+/// case reads plainly and a stemless job still says `0 stems`.
+fn stem_tally(stems: &[ImportedAsset]) -> String {
+    let reused = stems
+        .iter()
+        .filter(|s| s.origin == AssetOrigin::Existing)
+        .count();
+    let registered = stems.len() - reused;
+    let noun = if stems.len() == 1 { "stem" } else { "stems" };
+    let parts: Vec<String> = [(registered, "registered"), (reused, "reused")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    if parts.is_empty() {
+        format!("{} {noun}", stems.len())
+    } else {
+        format!("{} {noun}: {}", stems.len(), parts.join(", "))
+    }
+}
+
+fn run_import(job: PathBuf) -> ExitCode {
+    let Some(root) = project_root() else {
+        return ExitCode::FAILURE;
+    };
+    match import(&root, &job) {
+        Ok(ImportOutcome::Imported(report)) => {
+            println!(
+                "Imported '{}' ({})",
+                report.derivation_id,
+                stem_tally(&report.stems)
+            );
+            // Whether each file was captured now or was already under the
+            // manifest's protection is the point of the summary, so every line
+            // says which: the input resolved to an existing asset or registered,
+            // each stem registered or reused.
+            println!(
+                "  input:      {} ({}) [{}]",
+                report.input.asset.id,
+                report.input.asset.path,
+                match report.input.origin {
+                    AssetOrigin::Registered => "registered",
+                    AssetOrigin::Existing => "resolved to an existing asset",
+                }
+            );
+            for stem in &report.stems {
+                println!(
+                    "  stem:       {} ({}) [{}]",
+                    stem.asset.id,
+                    stem.asset.path,
+                    match stem.origin {
+                        AssetOrigin::Registered => "registered",
+                        AssetOrigin::Existing => "reused",
+                    }
+                );
+            }
+            println!("  derivation: {}", report.derivation_id);
+            ExitCode::SUCCESS
+        }
+        Ok(ImportOutcome::AlreadyImported { derivation_id }) => {
+            println!("Already imported as '{derivation_id}'; job.json unchanged, nothing to do");
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -360,7 +360,7 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
         }
         None => {
             let stem = rel.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            mint_id(&slugify(stem), &existing_ids)
+            mint_id_with(&slugify(stem), |c| existing_ids.contains(c))
         }
     };
 
@@ -382,6 +382,511 @@ pub fn add(root: &Path, rel: &Path, id: Option<&str>, role: &str) -> Result<Asse
     let bytes = manifest.to_canonical_json();
     write_atomic(&manifest_path, bytes.as_bytes()).map_err(AddError::Io)?;
     Ok(asset)
+}
+
+/// The tool recorded on derivations created by `import`; the only producer of
+/// job records this importer trusts (uncompose#63).
+const IMPORT_TOOL: &str = "uncompose";
+/// The role auto-registered inputs take.
+const INPUT_ROLE: &str = "mix";
+/// The role each imported stem takes.
+const STEM_ROLE: &str = "stem";
+
+/// A parsed `job.json` — the completion record `uncompose` writes into a job
+/// folder. Only the fields the import contract consumes are modeled; unknown
+/// fields are tolerated (not `deny_unknown_fields`), because the record format is
+/// owned by `uncompose` and will grow, and import treats it as evidence rather
+/// than a manifest it owns (uncompose#63).
+#[derive(Deserialize)]
+struct JobRecord {
+    /// The separated input, as `uncompose` recorded it; resolved relative to the
+    /// project root.
+    input_path: String,
+    /// The input's sha256 at separation time; the auto-registered file's current
+    /// bytes must still hash to this.
+    input_sha256: String,
+    /// The separation preset; the sole entry in the derivation's `params`.
+    preset: Value,
+    /// Stem names; each is `<name>.wav` in the job folder.
+    stems: Vec<String>,
+    /// The engine version, recorded as the derivation's `tool_version`.
+    engine_version: String,
+    /// The run's outcome; only `"success"` imports.
+    outcome: String,
+    /// Completion time, whole Unix seconds; the derivation's `created_at`.
+    finished_at_unix: u64,
+}
+
+/// How an import arrived at one of the assets it linked: by registering it, or by
+/// linking one the manifest already held. Import decides this per asset (the input
+/// by sha256, a stem by path) and the summary reports it, so a reader can tell a
+/// newly captured file from one already under the manifest's protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetOrigin {
+    /// This import registered the asset; it was not in the manifest before.
+    Registered,
+    /// The asset was already registered and was linked, not duplicated.
+    Existing,
+}
+
+/// One asset an import linked, paired with how import arrived at it.
+#[derive(Debug, Clone)]
+pub struct ImportedAsset {
+    pub asset: Asset,
+    pub origin: AssetOrigin,
+}
+
+/// The summary an `import` returns for the CLI to print: the resolved input, the
+/// stems, and the id of the derivation that ties them together. Each asset
+/// carries its [`AssetOrigin`], so the summary can say whether the input resolved
+/// to an existing asset or was registered, and which stems were reused.
+#[derive(Debug)]
+pub struct ImportReport {
+    pub input: ImportedAsset,
+    pub stems: Vec<ImportedAsset>,
+    pub derivation_id: String,
+}
+
+/// The result of an `import`: either a fresh import that wrote the manifest, or a
+/// stated no-op because a derivation already records this exact `job.json`
+/// (matched on its sha256). The idempotency key lets scripts re-run import safely.
+#[derive(Debug)]
+pub enum ImportOutcome {
+    /// The job was imported; the manifest was written.
+    Imported(Box<ImportReport>),
+    /// A derivation already records this `job.json` (same sha256); nothing was
+    /// written. The existing derivation's id is named.
+    AlreadyImported { derivation_id: String },
+}
+
+/// Why an `import` could not run. Every variant is raised before any write, so a
+/// refused import leaves the manifest byte-identical and is free to retry.
+#[derive(Debug)]
+pub enum ImportError {
+    /// The manifest could not be read/parsed (see [`LoadError`]).
+    Load(LoadError),
+    /// The `job.json` argument was absolute; paths are relative to the root.
+    JobAbsolutePath(PathBuf),
+    /// No `job.json` at the given path.
+    JobMissing(PathBuf),
+    /// The `job.json` exists but could not be read.
+    JobUnreadable(PathBuf, io::Error),
+    /// The `job.json` resolves outside the project root.
+    JobOutsideRoot(PathBuf),
+    /// The `job.json` is not valid JSON, or is missing a field import requires.
+    MalformedJob(PathBuf, serde_json::Error),
+    /// The job's `outcome` is not `"success"`; the value is shown.
+    NotSuccess(String),
+    /// `finished_at_unix` is not a representable timestamp.
+    InvalidTimestamp(u64),
+    /// The job record's `input_path` was absolute; recorded paths are relative to
+    /// the root. Carries the record's own string, not a resolved path.
+    InputAbsolutePath(String),
+    /// The job's input file is missing.
+    InputMissing(PathBuf),
+    /// The job's input file exists but could not be read to hash it.
+    InputUnreadable(PathBuf, io::Error),
+    /// The job's input resolves outside the project root.
+    InputOutsideRoot(PathBuf),
+    /// The input's current bytes no longer hash to the job's `input_sha256`; both
+    /// hashes are named.
+    InputHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    /// A stem file named by the job is missing from the job folder.
+    StemMissing(PathBuf),
+    /// A stem file exists but could not be read to hash it.
+    StemUnreadable(PathBuf, io::Error),
+    /// A stem resolves outside the project root.
+    StemOutsideRoot(PathBuf),
+    /// The input's path is already registered with a hash that conflicts with the
+    /// file the import would record; both hashes are named.
+    InputPathConflict {
+        path: String,
+        registered: String,
+        actual: String,
+    },
+    /// A stem's path is already registered with a hash that conflicts with the
+    /// file the import would record; both hashes are named.
+    StemPathConflict {
+        path: String,
+        registered: String,
+        actual: String,
+    },
+    /// Writing the manifest failed.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportError::Load(e) => write!(f, "{e}"),
+            ImportError::JobAbsolutePath(p) => write!(
+                f,
+                "{} is an absolute path; pass a path relative to the project root",
+                p.display()
+            ),
+            ImportError::JobMissing(p) => write!(f, "no such job record: {}", p.display()),
+            ImportError::JobUnreadable(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            ImportError::JobOutsideRoot(p) => write!(
+                f,
+                "{} resolves outside the project root; job records must live inside the project — move the job folder into the project root and import it from there",
+                p.display()
+            ),
+            ImportError::MalformedJob(p, e) => {
+                write!(f, "{} is not a valid job record: {e}", p.display())
+            }
+            ImportError::NotSuccess(outcome) => write!(
+                f,
+                "job outcome is '{outcome}', not 'success'; refusing to import a run that did not complete successfully"
+            ),
+            ImportError::InvalidTimestamp(secs) => write!(
+                f,
+                "job finished_at_unix {secs} is not a representable timestamp"
+            ),
+            ImportError::InputAbsolutePath(p) => write!(
+                f,
+                "the job records an absolute input_path ({p}); recorded paths must be relative to the project root — `uncompose-project add` the input so import resolves it by hash instead"
+            ),
+            ImportError::InputMissing(p) => write!(f, "input file not found: {}", p.display()),
+            ImportError::InputUnreadable(p, e) => write!(f, "cannot read input {}: {e}", p.display()),
+            ImportError::InputOutsideRoot(p) => write!(
+                f,
+                "input {} resolves outside the project root; `uncompose-project add` it first",
+                p.display()
+            ),
+            ImportError::InputHashMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "input {path} now hashes to {actual} but the job records {expected}; the file has changed since the separation"
+            ),
+            ImportError::StemMissing(p) => write!(f, "stem file not found: {}", p.display()),
+            ImportError::StemUnreadable(p, e) => write!(f, "cannot read stem {}: {e}", p.display()),
+            ImportError::StemOutsideRoot(p) => write!(
+                f,
+                "stem {} resolves outside the project root; move the stem inside the project root — a symlink pointing out of the tree does not count — and re-import",
+                p.display()
+            ),
+            ImportError::InputPathConflict {
+                path,
+                registered,
+                actual,
+            } => write!(
+                f,
+                "input {path} is registered with sha256 {registered} but the file now hashes to {actual}; resolve the conflict before importing"
+            ),
+            ImportError::StemPathConflict {
+                path,
+                registered,
+                actual,
+            } => write!(
+                f,
+                "stem {path} is registered with sha256 {registered} but the file now hashes to {actual}; resolve the conflict before importing"
+            ),
+            ImportError::Io(e) => write!(f, "failed to write manifest: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}
+
+impl From<LoadError> for ImportError {
+    fn from(e: LoadError) -> Self {
+        ImportError::Load(e)
+    }
+}
+
+/// Import a completed `uncompose` job at `job_arg` (relative to `root`): register
+/// its input as a `mix` asset, each stem as a `stem` asset, and one derivation
+/// recording the separation with a hashed reference to the `job.json`. The
+/// `job.json` itself is referenced, never registered as an asset.
+///
+/// A `job.json` whose sha256 a derivation already records is a stated no-op:
+/// [`ImportOutcome::AlreadyImported`] names the existing derivation and nothing
+/// is written. Otherwise refuses — leaving the manifest byte-identical — when the
+/// job record is missing/unreadable/malformed, its `outcome` is not success, the
+/// input's current bytes do not match the recorded `input_sha256`, the job
+/// argument or the record's `input_path` is absolute, any referenced file resolves
+/// outside the project root, or a referenced path is already registered with a
+/// conflicting hash. Writes the updated manifest once, atomically.
+pub fn import(root: &Path, job_arg: &Path) -> Result<ImportOutcome, ImportError> {
+    let manifest_path = root.join(MANIFEST_FILENAME);
+    let (_, mut manifest) = load_manifest(root)?;
+
+    let canonical_root = root.canonicalize().map_err(ImportError::Io)?;
+
+    // Locate and read the job record. An absolute argument refuses the same way
+    // `add` refuses one (ADR-0003): path arguments are relative to the project
+    // root, even when the absolute form happens to land inside it.
+    if job_arg.is_absolute() {
+        return Err(ImportError::JobAbsolutePath(job_arg.to_path_buf()));
+    }
+    let (job_abs, job_rel) =
+        canonical_inside(root, &canonical_root, job_arg).map_err(|k| match k {
+            ResolveKind::Missing => ImportError::JobMissing(job_arg.to_path_buf()),
+            ResolveKind::Unreadable(e) => ImportError::JobUnreadable(job_arg.to_path_buf(), e),
+            ResolveKind::Outside => ImportError::JobOutsideRoot(job_arg.to_path_buf()),
+        })?;
+    let job_bytes = std::fs::read(&job_abs)
+        .map_err(|e| ImportError::JobUnreadable(job_arg.to_path_buf(), e))?;
+    let job_sha256 = sha256_hex(&job_bytes);
+
+    // Idempotency (uncompose#63): any existing derivation whose `job.sha256` equals
+    // this record's is the same import already done — a stated no-op, exit 0, no
+    // manifest write. A different sha256 at the same path is a genuinely different
+    // run and falls through to import as a new derivation below.
+    if let Some(existing) = manifest
+        .derivations
+        .iter()
+        .find(|d| d.job.as_ref().is_some_and(|j| j.sha256 == job_sha256))
+    {
+        return Ok(ImportOutcome::AlreadyImported {
+            derivation_id: existing.id.clone(),
+        });
+    }
+
+    let job: JobRecord = serde_json::from_slice(&job_bytes)
+        .map_err(|e| ImportError::MalformedJob(job_arg.to_path_buf(), e))?;
+
+    // A run that did not complete successfully is never recorded as provenance.
+    if job.outcome != "success" {
+        return Err(ImportError::NotSuccess(job.outcome));
+    }
+
+    let created_at = unix_to_rfc3339(job.finished_at_unix)?;
+
+    let now = now_rfc3339();
+    // Ids are minted against the manifest's existing asset ids plus the ones this
+    // import is about to add, so a run with same-named stems does not collide.
+    let mut taken: HashSet<String> = manifest.assets.iter().map(|a| a.id.clone()).collect();
+    let mut new_assets: Vec<Asset> = Vec::new();
+
+    // Input resolution (uncompose#63): a registered asset whose sha256 already
+    // matches the job's `input_sha256` wins regardless of the job's `input_path`,
+    // so a mix already registered under any name links here without a duplicate.
+    // Only when no asset matches does import resolve the job's input path and
+    // auto-register it as `mix`, after confirming its current bytes still hash to
+    // the record. Import never copies files, so an out-of-tree input refuses.
+    let input_asset = if let Some(existing) = manifest
+        .assets
+        .iter()
+        .find(|a| a.sha256 == job.input_sha256)
+    {
+        ImportedAsset {
+            asset: existing.clone(),
+            origin: AssetOrigin::Existing,
+        }
+    } else {
+        let input_candidate = PathBuf::from(&job.input_path);
+        // Same rule as the job argument: a recorded input path is root-relative,
+        // so an absolute one refuses rather than being silently resolved.
+        if input_candidate.is_absolute() {
+            return Err(ImportError::InputAbsolutePath(job.input_path.clone()));
+        }
+        let (input_abs, input_rel) = canonical_inside(root, &canonical_root, &input_candidate)
+            .map_err(|k| match k {
+                ResolveKind::Missing => ImportError::InputMissing(input_candidate.clone()),
+                ResolveKind::Unreadable(e) => {
+                    ImportError::InputUnreadable(input_candidate.clone(), e)
+                }
+                ResolveKind::Outside => ImportError::InputOutsideRoot(input_candidate.clone()),
+            })?;
+        let (input_hash, input_size) = sha256_file(&input_abs)
+            .map_err(|e| ImportError::InputUnreadable(input_candidate.clone(), e))?;
+        if input_hash != job.input_sha256 {
+            return Err(ImportError::InputHashMismatch {
+                path: input_rel,
+                expected: job.input_sha256,
+                actual: input_hash,
+            });
+        }
+        // Per-path dedupe: no asset matched the input's hash above, so a registered
+        // asset at this path necessarily records a different hash — a conflict the
+        // import refuses rather than silently shadowing.
+        if let Some(existing) = manifest.assets.iter().find(|a| a.path == input_rel) {
+            return Err(ImportError::InputPathConflict {
+                path: input_rel,
+                registered: existing.sha256.clone(),
+                actual: input_hash,
+            });
+        }
+        let input_stem = Path::new(&input_rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let input_id = mint_id_with(&slugify(input_stem), |c| taken.contains(c));
+        taken.insert(input_id.clone());
+        let asset = Asset {
+            id: input_id,
+            path: input_rel,
+            sha256: input_hash,
+            size: input_size,
+            role: INPUT_ROLE.to_string(),
+            added_at: now.clone(),
+            last_verified: None,
+            ext: None,
+        };
+        new_assets.push(asset.clone());
+        ImportedAsset {
+            asset,
+            origin: AssetOrigin::Registered,
+        }
+    };
+
+    // Resolve, hash, and register each stem; they live as `<name>.wav` in the job
+    // folder, which must itself sit inside the project root.
+    let job_folder = job_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf());
+    let mut stem_assets = Vec::with_capacity(job.stems.len());
+    for name in &job.stems {
+        let candidate = job_folder.join(format!("{name}.wav"));
+        let (stem_abs, stem_rel) =
+            canonical_inside(root, &canonical_root, &candidate).map_err(|k| match k {
+                ResolveKind::Missing => ImportError::StemMissing(candidate.clone()),
+                ResolveKind::Unreadable(e) => ImportError::StemUnreadable(candidate.clone(), e),
+                ResolveKind::Outside => ImportError::StemOutsideRoot(candidate.clone()),
+            })?;
+        let (stem_hash, stem_size) = sha256_file(&stem_abs)
+            .map_err(|e| ImportError::StemUnreadable(candidate.clone(), e))?;
+        // Per-path dedupe: a path already registered (in the manifest or minted
+        // earlier this run) with a matching hash is reused rather than duplicated;
+        // the same path with a conflicting hash refuses. Identical bytes at a
+        // different path stay a distinct asset, since we match on path, not hash.
+        let already = manifest
+            .assets
+            .iter()
+            .map(|a| (a, AssetOrigin::Existing))
+            .chain(new_assets.iter().map(|a| (a, AssetOrigin::Registered)))
+            .find(|(a, _)| a.path == stem_rel);
+        if let Some((existing, origin)) = already {
+            if existing.sha256 != stem_hash {
+                return Err(ImportError::StemPathConflict {
+                    path: stem_rel,
+                    registered: existing.sha256.clone(),
+                    actual: stem_hash,
+                });
+            }
+            stem_assets.push(ImportedAsset {
+                asset: existing.clone(),
+                origin,
+            });
+            continue;
+        }
+        let id = mint_id_with(&slugify(name), |c| taken.contains(c));
+        taken.insert(id.clone());
+        let stem_asset = Asset {
+            id,
+            path: stem_rel,
+            sha256: stem_hash,
+            size: stem_size,
+            role: STEM_ROLE.to_string(),
+            added_at: now.clone(),
+            last_verified: None,
+            ext: None,
+        };
+        new_assets.push(stem_asset.clone());
+        stem_assets.push(ImportedAsset {
+            asset: stem_asset,
+            origin: AssetOrigin::Registered,
+        });
+    }
+
+    // The derivation ties the input to the stems; `params` carries only the
+    // preset, with the full record reachable behind the hashed `job` ref.
+    let deriv_taken: HashSet<String> = manifest.derivations.iter().map(|d| d.id.clone()).collect();
+    let folder_name = job_folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let derivation_id = mint_id_with(&slugify(folder_name), |c| deriv_taken.contains(c));
+
+    let mut params = Map::new();
+    params.insert("preset".to_string(), job.preset);
+
+    let derivation = Derivation {
+        id: derivation_id.clone(),
+        inputs: vec![input_asset.asset.id.clone()],
+        outputs: stem_assets.iter().map(|a| a.asset.id.clone()).collect(),
+        tool: IMPORT_TOOL.to_string(),
+        tool_version: Some(job.engine_version),
+        params: Some(params),
+        created_at,
+        job: Some(Job {
+            path: job_rel,
+            sha256: job_sha256,
+            ext: None,
+        }),
+        ext: None,
+    };
+
+    manifest.assets.extend(new_assets);
+    manifest.derivations.push(derivation);
+
+    let bytes = manifest.to_canonical_json();
+    write_atomic(&manifest_path, bytes.as_bytes()).map_err(ImportError::Io)?;
+
+    Ok(ImportOutcome::Imported(Box::new(ImportReport {
+        input: input_asset,
+        stems: stem_assets,
+        derivation_id,
+    })))
+}
+
+/// Why [`canonical_inside`] could not resolve a path; each caller maps it into a
+/// context-specific error (`add`'s path, or import's input vs stem vs job record).
+enum ResolveKind {
+    /// No file exists at the resolved location.
+    Missing,
+    /// The file exists but could not be canonicalized (a read failure).
+    Unreadable(io::Error),
+    /// The file resolves outside the project root.
+    Outside,
+}
+
+/// Resolve `candidate` (absolute, or relative to `root`) to its canonical path and
+/// its root-relative forward-slash form, confirming it lives inside the root.
+/// Canonicalizing both sides collapses `..` and follows symlinks, so an escape
+/// surfaces as a failed `strip_prefix` — the one confinement rule every command
+/// applies.
+fn canonical_inside(
+    root: &Path,
+    canonical_root: &Path,
+    candidate: &Path,
+) -> Result<(PathBuf, String), ResolveKind> {
+    let canonical = root
+        .join(candidate)
+        .canonicalize()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => ResolveKind::Missing,
+            _ => ResolveKind::Unreadable(e),
+        })?;
+    let inside = canonical
+        .strip_prefix(canonical_root)
+        .map_err(|_| ResolveKind::Outside)?;
+    let stored = inside
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((canonical, stored))
+}
+
+/// Render whole Unix seconds as a whole-second RFC3339 UTC string, matching the
+/// manifest's timestamp style.
+fn unix_to_rfc3339(secs: u64) -> Result<String, ImportError> {
+    let dt = i64::try_from(secs)
+        .ok()
+        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok())
+        .ok_or(ImportError::InvalidTimestamp(secs))?;
+    dt.format(&Rfc3339)
+        .map_err(|_| ImportError::InvalidTimestamp(secs))
 }
 
 /// The integrity of one asset, derived by re-checking disk against its recorded
@@ -570,7 +1075,9 @@ fn render_overview(m: &Manifest) -> String {
 }
 
 /// Render one derivation: id and tool header, then inputs, outputs, and when it
-/// was created.
+/// was created. An imported derivation also shows its preset and the hashed
+/// `job` reference (path + sha256); a hand-written derivation carrying neither
+/// simply omits those lines.
 fn render_derivation(o: &mut String, d: &Derivation) {
     use std::fmt::Write;
     let tool_label = match &d.tool_version {
@@ -581,6 +1088,22 @@ fn render_derivation(o: &mut String, d: &Derivation) {
     let _ = writeln!(o, "    inputs:  {}", d.inputs.join(", "));
     let _ = writeln!(o, "    outputs: {}", d.outputs.join(", "));
     let _ = writeln!(o, "    created: {}", d.created_at);
+    if let Some(preset) = d.params.as_ref().and_then(|p| p.get("preset")) {
+        let _ = writeln!(o, "    preset:  {}", render_scalar(preset));
+    }
+    if let Some(job) = &d.job {
+        let _ = writeln!(o, "    job:     {} (sha256 {})", job.path, job.sha256);
+    }
+}
+
+/// Render a JSON scalar for the human overview: a string as its bare contents,
+/// anything else as its compact JSON. Keeps `preset: studio` from printing as
+/// `"studio"` while still showing a non-string preset legibly.
+fn render_scalar(v: &Value) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    }
 }
 
 /// Read and strictly parse the manifest at `root`, returning both the exact file
@@ -642,10 +1165,9 @@ fn check_ext(owner: &str, ext: Option<&Map<String, Value>>) -> Result<(), LoadEr
     Ok(())
 }
 
-/// Resolve `rel` against `root` and return its root-relative, forward-slash path,
-/// refusing absolute paths and anything that resolves outside the root (via `../`
-/// or a symlink). Canonicalizing both sides collapses `..` and follows symlinks,
-/// so an escape shows up as a failed `strip_prefix`.
+/// Resolve `rel` against `root` and return its root-relative, forward-slash path
+/// (via [`canonical_inside`]), refusing absolute paths and anything that resolves
+/// outside the root (via `../` or a symlink).
 fn resolve_inside_root(root: &Path, rel: &Path) -> Result<String, AddError> {
     if rel.is_absolute() {
         return Err(AddError::AbsolutePath(rel.to_path_buf()));
@@ -653,18 +1175,11 @@ fn resolve_inside_root(root: &Path, rel: &Path) -> Result<String, AddError> {
     let canonical_root = root
         .canonicalize()
         .map_err(|e| AddError::Unreadable(root.to_path_buf(), e))?;
-    let canonical = root.join(rel).canonicalize().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => AddError::MissingFile(rel.to_path_buf()),
-        _ => AddError::Unreadable(rel.to_path_buf(), e),
+    let (_, stored) = canonical_inside(root, &canonical_root, rel).map_err(|k| match k {
+        ResolveKind::Missing => AddError::MissingFile(rel.to_path_buf()),
+        ResolveKind::Unreadable(e) => AddError::Unreadable(rel.to_path_buf(), e),
+        ResolveKind::Outside => AddError::OutsideRoot(rel.to_path_buf()),
     })?;
-    let inside = canonical
-        .strip_prefix(&canonical_root)
-        .map_err(|_| AddError::OutsideRoot(rel.to_path_buf()))?;
-    let stored = inside
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
     Ok(stored)
 }
 
@@ -675,12 +1190,24 @@ fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let size = io::copy(&mut file, &mut hasher)?;
-    let hex = hasher
+    Ok((hex_digest(hasher), size))
+}
+
+/// SHA-256 hex digest of exact in-memory bytes — the manifest's sha256 form. Used
+/// for the `job.json` reference, whose bytes are already in memory from parsing.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(hasher)
+}
+
+/// Finish a SHA-256 and render its digest as lowercase hex.
+fn hex_digest(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
-    Ok((hex, size))
+        .collect()
 }
 
 /// A character the schema slug pattern allows at the start: `[a-z0-9]`.
@@ -719,14 +1246,17 @@ fn slugify(stem: &str) -> String {
 }
 
 /// Return `base` if free, otherwise `base-2`, `base-3`, … until one is unused.
-fn mint_id(base: &str, taken: &HashSet<&str>) -> String {
-    if !taken.contains(base) {
+/// `taken` reports whether a candidate id is already used; a closure so callers
+/// with a growing set (import mints several ids in one pass) can answer against
+/// ids minted earlier in the same run, not just the manifest's existing ones.
+fn mint_id_with(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
         return base.to_string();
     }
     let mut n = 2;
     loop {
         let candidate = format!("{base}-{n}");
-        if !taken.contains(candidate.as_str()) {
+        if !taken(&candidate) {
             return candidate;
         }
         n += 1;
