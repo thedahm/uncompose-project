@@ -22,3 +22,4 @@ uncompose#64, dispatch uncompose ADR-0005).
 - [0010 — `import`: idempotent re-import and per-path asset dedupe](0010-import-idempotency-and-per-path-dedupe.md)
 - [0011 — `--project` everywhere and the flock sidecar](0011-project-flag-and-flock-sidecar.md)
 - [0012 — `import`: dispatch on schema URL and the evaluation entry](0012-import-dispatch-and-evaluation-entry.md)
+- [0013 — Tag-driven trusted release automation](0013-tag-driven-trusted-release-automation.md)

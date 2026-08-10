@@ -20,6 +20,14 @@ filesystem abstractions — real files in temp dirs. See
 [`.sandcastle/CODING_STANDARDS.md`](.sandcastle/CODING_STANDARDS.md) for the full
 testing and architecture rules.
 
+## Releasing
+
+Releases are automated: pushing a `vX.Y.Z` tag runs the full suite, builds the wheel,
+and publishes it to PyPI with Trusted Publishing — no credential is stored in this
+repo. [`docs/releasing.md`](docs/releasing.md) is the runbook (including how to
+rehearse against TestPyPI first); the reasoning is
+[ADR-0013](docs/adr/0013-tag-driven-trusted-release-automation.md).
+
 ## Governance
 
 Uncompose is created and maintained by Dominic Hanzely ([@thedahm](https://github.com/thedahm)),
