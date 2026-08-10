@@ -57,18 +57,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v5
 
-      # Linux x86_64 only, per the v0.1 platform scope (ADR-0004): one wheel,
-      # no matrix. maturin tags it with the highest manylinux policy the binary
-      # satisfies.
-      - name: Build the manylinux wheel
-        run: uvx maturin build --release --out dist
+      # Linux x86_64 only, per the v0.1 platform scope (ADR-0004): one wheel, no
+      # matrix. Built in the manylinux container rather than on the runner —
+      # the same choice uncompose's own release makes — so the binary is tagged
+      # against an old glibc and runs on machines older than the runner, which a
+      # plain `maturin build` here would quietly rule out.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          manylinux: auto
 
       - name: Check the wheel is the one this tag names
         run: ci/check-wheel.sh dist "${{ needs.version.outputs.version }}"
 
+      - uses: astral-sh/setup-uv@v5
       - name: Prove the wheel installs and dispatches
         run: ci/smoke-wheel.sh dist
 

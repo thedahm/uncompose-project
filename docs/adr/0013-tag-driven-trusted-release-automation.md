@@ -53,10 +53,20 @@ what this repo does with it and why the alternatives were declined.
   Story 23 asks for traceability that is verifiable rather than asserted; this is the
   form of it that a stranger can check from the index alone.
 
-- **One Linux wheel, no sdist.** The v0.1 platform scope is Linux x86_64 (ADR-0004), so
-  there is no matrix. No sdist is published either: it would compile a Rust toolchain on
-  a user's machine — including on platforms this release does not support — where the
-  absence of a wheel is the clearer answer.
+- **One Linux wheel, built in the manylinux container.** The v0.1 platform scope is
+  Linux x86_64 (ADR-0004), so there is no matrix. The release build goes through
+  `PyO3/maturin-action` with `manylinux: auto`, as uncompose's own release workflow
+  does, rather than the plain `maturin build` the CI wheel lane uses: on the runner the
+  binary is tagged against the runner's glibc, which quietly excludes every machine
+  older than it. CI's lane keeps the simpler build — it is checking that the packaging
+  still works, not producing the artifact anyone installs.
+
+- **No sdist.** Here this repo departs from uncompose's release, which publishes one:
+  an extension sdist would compile a Rust toolchain on a user's machine, including on
+  platforms this release does not support, where the absence of a wheel is the clearer
+  answer — and `uncompose-compare` cannot ship a buildable one at all, since its sdist
+  would lack the frontend bundle its build embeds. The two extensions release together
+  and are installed together; they publish the same shape.
 
 - **The wheel that was proven is the wheel that is published.** The build job runs
   `ci/smoke-wheel.sh` against the artifact and uploads it; `publish` downloads exactly
