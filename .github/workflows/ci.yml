@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs this one as its gate, so "the full suite passed"
+  # and "CI passed" can never mean two different things.
+  workflow_call:
 
 jobs:
   rust:
@@ -29,3 +32,13 @@ jobs:
         run: uvx maturin build --release --out dist
       - name: Smoke-test the installed binary
         run: ci/smoke-wheel.sh dist
+
+  release-checks:
+    # The guards the release workflow puts in front of `publish` — a tag that
+    # disagrees with the source version, a wheel that isn't the one the tag
+    # names. Seconds, no toolchain, so they are gated on every change rather
+    # than discovered at a release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/release-checks.test.sh

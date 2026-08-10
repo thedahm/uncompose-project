@@ -1,0 +1,111 @@
+name: release
+
+# Pushing a `vX.Y.Z` tag publishes that version to PyPI, and nothing else does.
+# One run carries the release end to end so it can be read as one audit trail:
+# refuse a tag that disagrees with the source version, run the repo's own CI as
+# the gate, build the manylinux wheel, prove it installs and answers, and upload
+# it with Trusted Publishing. No API token exists in this repo, so there is none
+# to leak — the publish job authenticates with a short-lived OIDC token PyPI
+# exchanges for the right to upload this project from this workflow.
+#
+# uncompose#97 (M6 slice 3); decided in ADR-0013 and uncompose ADR-0008.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Rehearsal. The same jobs, on demand, from any ref: `none` stops after the
+  # wheel is built and proven, `testpypi` also publishes it to TestPyPI.
+  workflow_dispatch:
+    inputs:
+      index:
+        description: Index to publish the rehearsal build to
+        type: choice
+        options: [none, testpypi]
+        default: none
+
+# Nothing here writes to the repository. The publish job adds `id-token: write`
+# for OIDC, and only that job.
+permissions:
+  contents: read
+
+jobs:
+  version:
+    # First, so a mis-tagged release costs a few seconds rather than a build.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version="$(ci/release-version.sh "$GITHUB_REF")"
+          else
+            version="$(ci/release-version.sh)"
+          fi
+          echo "releasing version $version" >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  gates:
+    # The repo's full suite, run as CI itself defines it. A tag that does not
+    # pass cannot ship.
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [version, gates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux x86_64 only, per the v0.1 platform scope (ADR-0004): one wheel, no
+      # matrix. Built in the manylinux container rather than on the runner —
+      # the same choice uncompose's own release makes — so the binary is tagged
+      # against an old glibc and runs on machines older than the runner, which a
+      # plain `maturin build` here would quietly rule out.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          manylinux: auto
+
+      - name: Check the wheel is the one this tag names
+        run: ci/check-wheel.sh dist "${{ needs.version.outputs.version }}"
+
+      - uses: astral-sh/setup-uv@v5
+      - name: Prove the wheel installs and dispatches
+        run: ci/smoke-wheel.sh dist
+
+      # The publish job uploads this artifact and never rebuilds, so the wheel
+      # that was proven is the wheel that is published.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push' || inputs.index == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      # The Trusted Publisher on each index is configured for this workflow file
+      # *and* this environment name, so a run of some other workflow — or of
+      # this one against the wrong index — cannot mint a usable token.
+      name: ${{ github.event_name == 'push' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event_name == 'push' && 'https://pypi.org/p/uncompose-project' || 'https://test.pypi.org/p/uncompose-project' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ github.event_name == 'push' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          # PEP 740 attestations, signed with the same OIDC identity: the
+          # published wheel names the repository, workflow, and commit that
+          # built it, so its provenance is checkable from the index alone.
+          attestations: true
+          print-hash: true
