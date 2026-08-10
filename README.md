@@ -16,7 +16,8 @@ the Uncompose family.
 Pre-v0.1: the first release is being built in the open on the
 [issue tracker](https://github.com/thedahm/uncompose-project/issues), with decisions
 recorded in [`docs/adr/`](docs/adr/). The install line below goes live with the `v0.1.0`
-tag.
+tag. See the [release notes](docs/releases/v0.1.0.md) and
+[known limitations](docs/known-limitations.md) for what v0.1 does and does not do.
 
 ## Install
 
