@@ -8,8 +8,8 @@ pub mod manifest;
 
 pub use lock::{ProjectLock, LOCK_WAIT_NOTICE};
 pub use manifest::{
-    add, import, init, show, verify, AddError, Asset, AssetOrigin, AssetStatus, Derivation,
-    EvalRecord, Evaluation, EvaluationReport, ImportError, ImportOutcome, ImportReport,
+    add, import, init, render_scalar, show, verify, AddError, Asset, AssetOrigin, AssetStatus,
+    Derivation, EvalRecord, Evaluation, EvaluationReport, ImportError, ImportOutcome, ImportReport,
     ImportedAsset, InitError, Integrity, Job, LoadError, Manifest, Project, ShowOutput,
     VerifyError, VerifyReport, COMPARE_SCHEMA_URL, DEFAULT_ROLE, SCHEMA_URL,
 };

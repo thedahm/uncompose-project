@@ -1999,6 +1999,11 @@ fn import_lands_a_compare_record_as_one_evaluation() {
         stdout.contains("evaluation") && stdout.contains("mix-a") && stdout.contains("mix-b"),
         "summary should name the evaluation and candidates: {stdout}"
     );
+    // Bare, not JSON-quoted — same rendering `show` uses for confidence (and preset).
+    assert!(
+        stdout.contains("confidence: 4"),
+        "summary should show the confidence bare: {stdout}"
+    );
     assert!(
         stdout.contains("record:") && stdout.contains("evaluations/cmp.json"),
         "summary should name the hashed record the entry now points at: {stdout}"

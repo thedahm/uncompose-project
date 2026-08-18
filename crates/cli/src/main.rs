@@ -9,8 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use uncompose_project_core::{
-    add, import, init, show, tagline, verify, AssetOrigin, ImportOutcome, ImportedAsset, Integrity,
-    DEFAULT_ROLE,
+    add, import, init, render_scalar, show, tagline, verify, AssetOrigin, ImportOutcome,
+    ImportedAsset, Integrity, DEFAULT_ROLE,
 };
 
 #[derive(Parser)]
@@ -246,11 +246,7 @@ fn run_import(root: &Path, job: PathBuf) -> ExitCode {
                 report.preference.as_deref().unwrap_or("none")
             );
             if let Some(confidence) = &report.confidence {
-                // A string confidence prints bare; anything else as compact JSON.
-                match confidence.as_str() {
-                    Some(s) => println!("  confidence: {s}"),
-                    None => println!("  confidence: {confidence}"),
-                }
+                println!("  confidence: {}", render_scalar(confidence));
             }
             // The record ref closes the summary the way the job arm's `derivation:`
             // does: the thing the entry now points at, which the header did not say.
