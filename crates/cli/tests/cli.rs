@@ -384,6 +384,41 @@ fn add_refuses_an_invalid_id() {
 }
 
 #[test]
+fn add_refuses_a_role_that_is_not_a_slug() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav", "--role", "Not A Slug"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("role"), "stderr: {stderr}");
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn add_refuses_an_explicit_id_already_in_use() {
+    let dir = init_project();
+    fs::write(dir.path().join("a.wav"), b"hello").unwrap();
+    fs::write(dir.path().join("b.wav"), b"world").unwrap();
+    assert!(run(dir.path(), &["add", "a.wav", "--id", "shared"])
+        .status
+        .success());
+
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let output = run(dir.path(), &["add", "b.wav", "--id", "shared"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("shared"), "stderr: {stderr}");
+    assert!(stderr.contains("already in use"), "stderr: {stderr}");
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn add_refuses_when_the_directory_is_not_a_project() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("song.wav"), b"hello").unwrap();
