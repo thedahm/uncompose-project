@@ -384,6 +384,46 @@ fn add_refuses_an_invalid_id() {
 }
 
 #[test]
+fn add_refuses_a_role_that_is_not_a_slug() {
+    let dir = init_project();
+    fs::write(dir.path().join("song.wav"), b"hello").unwrap();
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    let output = run(dir.path(), &["add", "song.wav", "--role", "Not A Slug"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("role 'Not A Slug'") && stderr.contains("is not a valid slug"),
+        "error should name the offending role and why it was refused: {stderr}"
+    );
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn add_refuses_an_explicit_id_already_in_use() {
+    let dir = init_project();
+    fs::write(dir.path().join("a.wav"), b"hello").unwrap();
+    fs::write(dir.path().join("b.wav"), b"world").unwrap();
+    assert!(run(dir.path(), &["add", "a.wav", "--id", "shared"])
+        .status
+        .success());
+
+    let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_valid_against_schema(&serde_json::from_str::<Value>(&before).unwrap());
+
+    let output = run(dir.path(), &["add", "b.wav", "--id", "shared"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("shared"), "stderr: {stderr}");
+    assert!(stderr.contains("already in use"), "stderr: {stderr}");
+
+    let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn add_refuses_when_the_directory_is_not_a_project() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("song.wav"), b"hello").unwrap();
@@ -1452,6 +1492,25 @@ fn verify_reports_all_verified_updates_last_verified_and_exits_zero() {
     assert_valid_against_schema(&manifest);
 }
 
+/// A freshly-init'd project has no assets and no records, so the verify loop
+/// body never runs. It must still say something rather than exit 0 silently.
+#[test]
+fn verify_on_an_empty_project_prints_nothing_to_verify() {
+    let dir = init_project();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        output.status.success(),
+        "verify should exit zero on an empty project: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("nothing to verify"),
+        "verify should say there is nothing to verify: {stdout}"
+    );
+}
+
 /// Milestone DoD (modified): change a registered file on disk, then `verify`
 /// must warn — naming the path and that the contents changed — and exit non-zero.
 #[test]
@@ -1963,6 +2022,11 @@ fn import_lands_a_compare_record_as_one_evaluation() {
     assert!(
         stdout.contains("evaluation") && stdout.contains("mix-a") && stdout.contains("mix-b"),
         "summary should name the evaluation and candidates: {stdout}"
+    );
+    // Bare, not JSON-quoted — same rendering `show` uses for confidence (and preset).
+    assert!(
+        stdout.contains("confidence: 4"),
+        "summary should show the confidence bare: {stdout}"
     );
     assert!(
         stdout.contains("record:") && stdout.contains("evaluations/cmp.json"),
