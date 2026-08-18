@@ -126,6 +126,11 @@ fn run_verify(root: &Path) -> ExitCode {
         }
     };
 
+    if report.statuses.is_empty() && report.records.is_empty() {
+        println!("nothing to verify");
+        return ExitCode::SUCCESS;
+    }
+
     // Passes to stdout; failures to stderr as warnings naming path and cause.
     // Evaluation record files (report.records) are policed the same way as assets.
     let mut modified = 0;

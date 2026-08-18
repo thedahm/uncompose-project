@@ -1487,6 +1487,25 @@ fn verify_reports_all_verified_updates_last_verified_and_exits_zero() {
     assert_valid_against_schema(&manifest);
 }
 
+/// A freshly-init'd project has no assets and no records, so the verify loop
+/// body never runs. It must still say something rather than exit 0 silently.
+#[test]
+fn verify_on_an_empty_project_prints_nothing_to_verify() {
+    let dir = init_project();
+
+    let output = run(dir.path(), &["verify"]);
+    assert!(
+        output.status.success(),
+        "verify should exit zero on an empty project: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("nothing to verify"),
+        "verify should say there is nothing to verify: {stdout}"
+    );
+}
+
 /// Milestone DoD (modified): change a registered file on disk, then `verify`
 /// must warn — naming the path and that the contents changed — and exit non-zero.
 #[test]
