@@ -1592,8 +1592,12 @@ fn render_derivation(o: &mut String, d: &Derivation) {
 
 /// Render a JSON scalar for the human overview: a string as its bare contents,
 /// anything else as its compact JSON. Keeps `preset: studio` from printing as
-/// `"studio"` while still showing a non-string preset legibly.
-fn render_scalar(v: &Value) -> String {
+/// `"studio"` while still showing a non-string preset legibly. Shared by `show`
+/// (here, for `preset` and `confidence`) and the CLI's `import` summary (for
+/// `confidence`), so the two never drift. The compare v0 schema currently pins
+/// `confidence` to an integer 1-5, so the string branch is live for `preset`
+/// only today; it stays so a future non-integer `confidence` still renders bare.
+pub fn render_scalar(v: &Value) -> String {
     match v.as_str() {
         Some(s) => s.to_string(),
         None => v.to_string(),
