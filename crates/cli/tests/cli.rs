@@ -392,7 +392,10 @@ fn add_refuses_a_role_that_is_not_a_slug() {
     let output = run(dir.path(), &["add", "song.wav", "--role", "Not A Slug"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("role"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("role 'Not A Slug'") && stderr.contains("is not a valid slug"),
+        "error should name the offending role and why it was refused: {stderr}"
+    );
 
     let after = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
     assert_eq!(before, after);
@@ -408,6 +411,8 @@ fn add_refuses_an_explicit_id_already_in_use() {
         .success());
 
     let before = fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    assert_valid_against_schema(&serde_json::from_str::<Value>(&before).unwrap());
+
     let output = run(dir.path(), &["add", "b.wav", "--id", "shared"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
