@@ -13,16 +13,19 @@ the Uncompose family.
 
 ## Status
 
-Pre-v0.1: the first release is being built in the open on the
-[issue tracker](https://github.com/thedahm/uncompose-project/issues), with decisions
-recorded in [`docs/adr/`](docs/adr/). The install line below goes live with the `v0.1.0`
-tag. See the [release notes](docs/releases/v0.1.0.md) and
+v0.1.0 is [on PyPI](https://pypi.org/project/uncompose-project/). Development happens
+in the open on the [issue tracker](https://github.com/thedahm/uncompose-project/issues),
+with decisions recorded in [`docs/adr/`](docs/adr/). See the
+[release notes](docs/releases/v0.1.0.md) and
 [known limitations](docs/known-limitations.md) for what v0.1 does and does not do.
 
 ## Install
 
+Part of the [Uncompose](https://github.com/thedahm/uncompose) family; with the
+`uncompose` dispatcher installed, `uncompose project …` runs it too.
+
 ```sh
-pip install uncompose-project        # placeholder — lands with v0.1.0
+uv tool install uncompose-project      # or: pip install uncompose-project
 ```
 
 ## Commands
